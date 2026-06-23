@@ -24,3 +24,6 @@
 
 // 1 when the Vulkan back-end (vk_renderer.hpp) is available, else 0.
 #define SHADERTOY_HAVE_VULKAN @SHADERTOY_HAVE_VULKAN@
+
+// 1 when the Shadertoy JSON loader (loader.hpp) is available, else 0.
+#define SHADERTOY_HAVE_JSON @SHADERTOY_HAVE_JSON@

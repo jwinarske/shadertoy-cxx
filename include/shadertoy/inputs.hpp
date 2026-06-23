@@ -86,12 +86,25 @@ struct PushConstants {
 /// iResolution), so the library has something to render with no arguments.
 [[nodiscard]] const char* DefaultImageShader() noexcept;
 
-/// Wrap a bare Shadertoy Image shader into a complete GLSL ES 3.0 shader.
-[[nodiscard]] std::string WrapGles(const std::string& image_shader);
+/// Wrap a Shadertoy pass (Common tab + pass code) into a complete GLSL ES 3.0
+/// fragment shader.
+[[nodiscard]] std::string WrapGles(const std::string& common,
+                                   const std::string& code);
 
-/// Wrap a bare Shadertoy Image shader into a complete Vulkan GLSL shader
-/// (ready to feed to glslang / shaderc for SPIR-V compilation).
-[[nodiscard]] std::string WrapVulkan(const std::string& image_shader);
+/// Single-pass convenience: wrap bare Image code with no Common tab.
+[[nodiscard]] inline std::string WrapGles(const std::string& image_shader) {
+  return WrapGles(std::string(), image_shader);
+}
+
+/// Wrap a Shadertoy pass (Common tab + pass code) into a complete Vulkan GLSL
+/// fragment shader (ready to feed to glslang / shaderc for SPIR-V).
+[[nodiscard]] std::string WrapVulkan(const std::string& common,
+                                     const std::string& code);
+
+/// Single-pass convenience: wrap bare Image code with no Common tab.
+[[nodiscard]] inline std::string WrapVulkan(const std::string& image_shader) {
+  return WrapVulkan(std::string(), image_shader);
+}
 
 /// Read a Shadertoy Image shader from @p path.  Returns the file contents, or
 /// an empty string on failure (caller should fall back to DefaultImageShader).

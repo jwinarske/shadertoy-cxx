@@ -25,12 +25,31 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) { /* ... */ }
 
 shadertoy-cxx wraps that snippet into a complete fragment shader for the chosen
 back-end, declaring the standard uniforms (`iResolution`, `iTime`, `iTimeDelta`,
-`iFrame`, `iMouse`, `iDate`, `iSampleRate`, `iFrameRate`) and the `iChannel0..3`
-samplers (bound to a 1×1 black texture). A full-screen triangle is drawn and the
-shader does all the work.
+`iFrame`, `iMouse`, `iDate`, `iSampleRate`, `iFrameRate`, `iChannelResolution`)
+and the `iChannel0..3` samplers. A full-screen triangle is drawn and the shader
+does all the work.
 
-> Multi-pass / texture / cubemap / audio channel inputs are out of scope — this
-> renders single-pass Image shaders.
+### Multi-pass programs
+
+Real Shadertoy shaders can have a **Common** tab, up to four **Buffer** passes
+(A–D, each double-buffered so it can read its own and other buffers' previous
+frame — feedback), and an **Image** pass, each binding up to four channels. The
+`ShaderProgram` model (`program.hpp`) captures this, and the JSON loader
+(`loader.hpp`) builds one straight from a Shadertoy API/export `.json`:
+
+```cpp
+shadertoy::ShaderProgram prog;
+shadertoy::LoadShadertoyJsonFile("shader.json", prog);
+glRenderer.SetProgram(prog);   // buffers + common + texture channels
+```
+
+Channel support: **buffer** and **texture** (image files, via stb_image) are
+rendered; **keyboard** and **audio** channels are stubbed to a black/zero
+texture (shaders compile and run, just without that input). Cubemap/volume/video
+inputs are unsupported.
+
+> The Vulkan back-end currently renders single-pass Image shaders; multi-pass on
+> Vulkan is in progress. The OpenGL ES 3 back-end is fully multi-pass.
 
 ## Layout
 

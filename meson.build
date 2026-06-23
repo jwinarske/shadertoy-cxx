@@ -4,7 +4,7 @@
 project(
     'shadertoy-cxx',
     'cpp',
-    version: '0.1.0',
+    version: '0.2.0',
     license: 'MIT',
     meson_version: '>= 1.1',
     default_options: [
@@ -36,21 +36,27 @@ conf.set('SHADERTOY_VERSION_PATCH',  ver[2])
 conf.set('SHADERTOY_VERSION_STRING', meson.project_version())
 conf.set('SHADERTOY_HAVE_GL',     have_gl     ? '1' : '0')
 conf.set('SHADERTOY_HAVE_VULKAN', have_vulkan ? '1' : '0')
+conf.set('SHADERTOY_HAVE_JSON',   '1')   # loader uses the vendored nlohmann/json
 
 subdir('include/shadertoy')   # generates config.hpp into the build include tree
 
-# ── Public include directory (source + generated config in build tree) ────────
+# ── Public + private include directories ──────────────────────────────────────
 
-public_inc = include_directories('include')
+public_inc  = include_directories('include')
+# Vendored, header-only third-party deps (not exposed in public headers).
+private_inc = include_directories('third_party/stb', 'third_party')
 
 # ── Library sources — core is always built; back-ends gate in ─────────────────
+# The Common-tab/multipass model, the Shadertoy JSON loader (nlohmann/json), and
+# the source-wrapping helpers are always present.
 
-sources = ['src/inputs.cpp']
+sources = ['src/inputs.cpp', 'src/program.cpp', 'src/loader.cpp']
 deps    = []
 pc_requires = []
 
 if have_gl
-    sources += 'src/gl_renderer.cpp'
+    # gl_renderer pulls in stb_image (vendored) for texture channels.
+    sources += ['src/gl_renderer.cpp', 'src/stb_image_impl.cpp']
     deps    += glesv2_dep
     pc_requires += 'glesv2'
 endif
@@ -68,7 +74,7 @@ shadertoy_lib = library(
     sources,
     version:                 meson.project_version(),
     soversion:               ver[0],
-    include_directories:     public_inc,
+    include_directories:     [public_inc, private_inc],
     dependencies:            deps,
     gnu_symbol_visibility:   'default',
     install:                 true,
@@ -76,7 +82,12 @@ shadertoy_lib = library(
 
 # ── Install public headers ────────────────────────────────────────────────────
 
-install_headers('include/shadertoy/inputs.hpp', subdir: 'shadertoy')
+install_headers(
+    'include/shadertoy/inputs.hpp',
+    'include/shadertoy/program.hpp',
+    'include/shadertoy/loader.hpp',
+    subdir: 'shadertoy',
+)
 if have_gl
     install_headers('include/shadertoy/gl_renderer.hpp', subdir: 'shadertoy')
 endif

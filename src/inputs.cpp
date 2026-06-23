@@ -112,12 +112,12 @@ const char* DefaultImageShader() noexcept {
   return kDefaultImageShader;
 }
 
-std::string WrapGles(const std::string& image_shader) {
-  return std::string(kGlesHeader) + image_shader + kGlesFooter;
+std::string WrapGles(const std::string& common, const std::string& code) {
+  return std::string(kGlesHeader) + common + "\n" + code + kGlesFooter;
 }
 
-std::string WrapVulkan(const std::string& image_shader) {
-  return std::string(kVulkanHeader) + image_shader + kVulkanFooter;
+std::string WrapVulkan(const std::string& common, const std::string& code) {
+  return std::string(kVulkanHeader) + common + "\n" + code + kVulkanFooter;
 }
 
 std::string LoadShaderFile(const std::string& path) {
