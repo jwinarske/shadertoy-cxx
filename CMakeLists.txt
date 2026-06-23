@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(shadertoy-cxx
-    VERSION 0.1.0
+    VERSION 0.3.0
     DESCRIPTION "Platform-agnostic Shadertoy renderer (OpenGL ES 3 + Vulkan)"
     LANGUAGES CXX)
 
@@ -62,19 +62,30 @@ set(SHADERTOY_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 set(SHADERTOY_VERSION_STRING ${PROJECT_VERSION})
 set(SHADERTOY_HAVE_GL ${HAVE_GL})
 set(SHADERTOY_HAVE_VULKAN ${HAVE_VULKAN})
+set(SHADERTOY_HAVE_JSON 1)  # loader uses the vendored nlohmann/json
+set(SHADERTOY_SHADER_DIR ${CMAKE_INSTALL_FULL_DATADIR}/shadertoy-cxx/shaders)
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/shadertoy/config.hpp.in
   ${CMAKE_CURRENT_BINARY_DIR}/include/shadertoy/config.hpp
   @ONLY)
 
 # ── Library ───────────────────────────────────────────────────────────────────
-set(SHADERTOY_SOURCES src/inputs.cpp)
+# Core (always): model, JSON loader (nlohmann/json), playlist, source wrappers.
+set(SHADERTOY_SOURCES
+    src/inputs.cpp
+    src/program.cpp
+    src/loader.cpp
+    src/playlist.cpp)
 set(SHADERTOY_PUBLIC_HEADERS
     include/shadertoy/inputs.hpp
+    include/shadertoy/program.hpp
+    include/shadertoy/loader.hpp
+    include/shadertoy/playlist.hpp
     ${CMAKE_CURRENT_BINARY_DIR}/include/shadertoy/config.hpp)
 
 if(HAVE_GL)
-  list(APPEND SHADERTOY_SOURCES src/gl_renderer.cpp)
+  # gl_renderer pulls in stb_image (vendored) for texture channels.
+  list(APPEND SHADERTOY_SOURCES src/gl_renderer.cpp src/stb_image_impl.cpp)
   list(APPEND SHADERTOY_PUBLIC_HEADERS include/shadertoy/gl_renderer.hpp)
 endif()
 if(HAVE_VULKAN)
@@ -97,6 +108,11 @@ target_include_directories(shadertoy PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
+# Vendored header-only third-party deps (not exposed in public headers).
+target_include_directories(shadertoy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
 if(HAVE_GL)
   target_link_libraries(shadertoy PUBLIC PkgConfig::GLESV2)
 endif()
@@ -116,6 +132,14 @@ install(TARGETS shadertoy
 
 install(FILES ${SHADERTOY_PUBLIC_HEADERS}
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/shadertoy)
+
+# Bundled shader set — only license-compatible shaders (see shaders/CREDITS.md).
+install(FILES
+    shaders/default.frag
+    shaders/trail.json
+    shaders/X3yXRd.json
+    shaders/CREDITS.md
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/shadertoy-cxx/shaders)
 
 # CMake package config.
 set(SHADERTOY_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/shadertoy-cxx)

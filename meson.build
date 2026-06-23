@@ -4,7 +4,7 @@
 project(
     'shadertoy-cxx',
     'cpp',
-    version: '0.2.0',
+    version: '0.3.0',
     license: 'MIT',
     meson_version: '>= 1.1',
     default_options: [
@@ -37,6 +37,8 @@ conf.set('SHADERTOY_VERSION_STRING', meson.project_version())
 conf.set('SHADERTOY_HAVE_GL',     have_gl     ? '1' : '0')
 conf.set('SHADERTOY_HAVE_VULKAN', have_vulkan ? '1' : '0')
 conf.set('SHADERTOY_HAVE_JSON',   '1')   # loader uses the vendored nlohmann/json
+shader_install_dir = get_option('prefix') / get_option('datadir') / 'shadertoy-cxx' / 'shaders'
+conf.set('SHADERTOY_SHADER_DIR',  shader_install_dir)
 
 subdir('include/shadertoy')   # generates config.hpp into the build include tree
 
@@ -50,7 +52,8 @@ private_inc = include_directories('third_party/stb', 'third_party')
 # The Common-tab/multipass model, the Shadertoy JSON loader (nlohmann/json), and
 # the source-wrapping helpers are always present.
 
-sources = ['src/inputs.cpp', 'src/program.cpp', 'src/loader.cpp']
+sources = ['src/inputs.cpp', 'src/program.cpp', 'src/loader.cpp',
+           'src/playlist.cpp']
 deps    = []
 pc_requires = []
 
@@ -86,8 +89,21 @@ install_headers(
     'include/shadertoy/inputs.hpp',
     'include/shadertoy/program.hpp',
     'include/shadertoy/loader.hpp',
+    'include/shadertoy/playlist.hpp',
     subdir: 'shadertoy',
 )
+
+# ── Install the bundled shader set ────────────────────────────────────────────
+# Only license-compatible shaders are bundled (see shaders/CREDITS.md):
+# original MIT shaders plus X3yXRd (MIT, notice retained).
+install_data(
+    'shaders/default.frag',
+    'shaders/trail.json',
+    'shaders/X3yXRd.json',
+    'shaders/CREDITS.md',
+    install_dir: get_option('datadir') / 'shadertoy-cxx' / 'shaders',
+)
+
 if have_gl
     install_headers('include/shadertoy/gl_renderer.hpp', subdir: 'shadertoy')
 endif

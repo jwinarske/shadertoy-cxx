@@ -27,3 +27,7 @@
 
 // 1 when the Shadertoy JSON loader (loader.hpp) is available, else 0.
 #define SHADERTOY_HAVE_JSON @SHADERTOY_HAVE_JSON@
+
+// Install location of the bundled shader set (overridable at runtime via the
+// SHADERTOY_SHADER_DIR environment variable; see shadertoy::DefaultShaderDir).
+#define SHADERTOY_SHADER_DIR "@SHADERTOY_SHADER_DIR@"
