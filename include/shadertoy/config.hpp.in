@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 shadertoy-cxx contributors
+//
+// config.hpp — generated build configuration for shadertoy-cxx.
+//
+// Generated from config.hpp.in by both the CMake and Meson builds.  Consumers
+// can test the SHADERTOY_HAVE_* macros to discover which rendering back-ends
+// were compiled into the library:
+//
+//   #include <shadertoy/config.hpp>
+//   #if SHADERTOY_HAVE_VULKAN
+//   #  include <shadertoy/vk_renderer.hpp>
+//   #endif
+
+#pragma once
+
+#define SHADERTOY_VERSION_MAJOR @SHADERTOY_VERSION_MAJOR@
+#define SHADERTOY_VERSION_MINOR @SHADERTOY_VERSION_MINOR@
+#define SHADERTOY_VERSION_PATCH @SHADERTOY_VERSION_PATCH@
+#define SHADERTOY_VERSION_STRING "@SHADERTOY_VERSION_STRING@"
+
+// 1 when the OpenGL ES 3.0 back-end (gl_renderer.hpp) is available, else 0.
+#define SHADERTOY_HAVE_GL @SHADERTOY_HAVE_GL@
+
+// 1 when the Vulkan back-end (vk_renderer.hpp) is available, else 0.
+#define SHADERTOY_HAVE_VULKAN @SHADERTOY_HAVE_VULKAN@

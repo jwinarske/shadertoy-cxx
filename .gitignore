@@ -1,0 +1,27 @@
+# Build directories
+build/
+builddir/
+_build/
+cmake-build-*/
+
+# Meson private
+.mesonpy/
+meson-private/
+subprojects/packagecache/
+subprojects/*/
+!subprojects/*.wrap
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+install/
+
+# Editor / IDE artifacts
+.vscode/
+.idea/
+.cache/
+*.swp
+*~
+
+# OS artifacts
+.DS_Store

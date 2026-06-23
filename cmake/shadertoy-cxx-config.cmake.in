@@ -1,0 +1,21 @@
+@PACKAGE_INIT@
+
+# SPDX-License-Identifier: MIT
+# CMake package config for shadertoy-cxx. Re-discovers the back-end
+# dependencies that were enabled when the library was built, then pulls in the
+# exported imported target shadertoy-cxx::shadertoy.
+
+include(CMakeFindDependencyMacro)
+
+if(@HAVE_GL@)
+  find_dependency(PkgConfig)
+  pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
+endif()
+
+if(@HAVE_VULKAN@)
+  find_dependency(Vulkan)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/shadertoy-cxx-targets.cmake")
+
+check_required_components(shadertoy-cxx)
