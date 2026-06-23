@@ -13,6 +13,7 @@
 #include <shadertoy/config.hpp>
 #include <shadertoy/inputs.hpp>
 #include <shadertoy/loader.hpp>
+#include <shadertoy/playlist.hpp>
 #include <shadertoy/program.hpp>
 
 #if SHADERTOY_HAVE_VULKAN
@@ -63,7 +64,26 @@ int ProbeJson(const char* path) {
 }
 }  // namespace
 
+int ProbeDir(const char* arg) {
+  const std::string dir = arg ? std::string(arg) : shadertoy::DefaultShaderDir();
+  std::printf("shader dir: %s\n", dir.c_str());
+  shadertoy::Playlist pl;
+  const size_t n = pl.AddDirectory(dir);
+  std::printf("loaded %zu program(s):\n", n);
+  for (size_t i = 0; i < pl.size(); ++i) {
+    std::printf("  [%zu] %s%s\n", i, pl.current().name.c_str(),
+                pl.current().multipass() ? " (multipass)" : "");
+    pl.next();
+  }
+  std::printf("probe: OK\n");
+  return n > 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
+  // --dir [path] : list the shaders a Playlist loads from a directory.
+  if (argc > 1 && std::strcmp(argv[1], "--dir") == 0)
+    return ProbeDir(argc > 2 ? argv[2] : nullptr);
+
   // A .json argument is parsed as a full Shadertoy export (multi-pass).
   if (argc > 1) {
     const char* a = argv[1];
