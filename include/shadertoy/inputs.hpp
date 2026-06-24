@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -82,14 +83,28 @@ struct PushConstants {
 
 // ── Source assembly ───────────────────────────────────────────────────────────
 
+/// Sampler dimensionality for a channel, so the wrapper declares iChannelN with
+/// the GLSL sampler type the pass actually samples (a cubemap shader does
+/// `texture(iChannelN, vec3)`, which will not compile against a sampler2D).
+enum class SamplerDim { k2D, kCube, k3D };
+
 /// A self-contained default Shadertoy Image shader (uses only iTime and
 /// iResolution), so the library has something to render with no arguments.
 [[nodiscard]] const char* DefaultImageShader() noexcept;
 
 /// Wrap a Shadertoy pass (Common tab + pass code) into a complete GLSL ES 3.0
-/// fragment shader.
+/// fragment shader, declaring iChannel0..3 with the given sampler types.
 [[nodiscard]] std::string WrapGles(const std::string& common,
-                                   const std::string& code);
+                                   const std::string& code,
+                                   const std::array<SamplerDim, 4>& channels);
+
+/// Convenience: wrap a pass whose channels are all 2D (or unsampled).
+[[nodiscard]] inline std::string WrapGles(const std::string& common,
+                                          const std::string& code) {
+  return WrapGles(common, code,
+                  {SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D,
+                   SamplerDim::k2D});
+}
 
 /// Single-pass convenience: wrap bare Image code with no Common tab.
 [[nodiscard]] inline std::string WrapGles(const std::string& image_shader) {
@@ -99,7 +114,16 @@ struct PushConstants {
 /// Wrap a Shadertoy pass (Common tab + pass code) into a complete Vulkan GLSL
 /// fragment shader (ready to feed to glslang / shaderc for SPIR-V).
 [[nodiscard]] std::string WrapVulkan(const std::string& common,
-                                     const std::string& code);
+                                     const std::string& code,
+                                     const std::array<SamplerDim, 4>& channels);
+
+/// Convenience: wrap a pass whose channels are all 2D (or unsampled).
+[[nodiscard]] inline std::string WrapVulkan(const std::string& common,
+                                            const std::string& code) {
+  return WrapVulkan(common, code,
+                    {SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D,
+                     SamplerDim::k2D});
+}
 
 /// Single-pass convenience: wrap bare Image code with no Common tab.
 [[nodiscard]] inline std::string WrapVulkan(const std::string& image_shader) {

@@ -137,7 +137,21 @@ int main(int argc, char** argv) {
     }
     bool any_fail = false;
     auto do_pass = [&](const char* label, const shadertoy::Pass& pass) {
-      const std::string gl = shadertoy::WrapGles(prog.common, pass.code);
+      // Mirror GlRenderer::BuildPass: declare each iChannel with the sampler
+      // type its kind requires, so cubemap/volume shaders wrap correctly.
+      std::array<shadertoy::SamplerDim, 4> dims = {
+          shadertoy::SamplerDim::k2D, shadertoy::SamplerDim::k2D,
+          shadertoy::SamplerDim::k2D, shadertoy::SamplerDim::k2D};
+      for (int i = 0; i < 4; ++i) {
+        switch (pass.channels[static_cast<size_t>(i)].kind) {
+          case shadertoy::ChannelKind::kCubemap:
+            dims[static_cast<size_t>(i)] = shadertoy::SamplerDim::kCube; break;
+          case shadertoy::ChannelKind::kVolume:
+            dims[static_cast<size_t>(i)] = shadertoy::SamplerDim::k3D; break;
+          default: break;
+        }
+      }
+      const std::string gl = shadertoy::WrapGles(prog.common, pass.code, dims);
       const std::string e = CompileFrag(gl);
       if (!e.empty()) {
         any_fail = true;

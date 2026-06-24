@@ -150,8 +150,14 @@ bool LoadShadertoyJson(const std::string& json_text,
       } else if (ctype == "musicstream" || ctype == "music" || ctype == "mic" ||
                  ctype == "soundcloud") {
         ch.kind = ChannelKind::kAudio;
+      } else if (ctype == "cubemap") {
+        ch.kind = ChannelKind::kCubemap;
+        ch.texture_path = in.value("src", "");  // src kept to resolve media files
+      } else if (ctype == "volume") {
+        ch.kind = ChannelKind::kVolume;
+        ch.texture_path = in.value("src", "");  // src kept to resolve media files
       } else {
-        continue;  // cubemap/volume/video — unsupported, leave channel unbound
+        continue;  // video/webcam — unsupported, leave channel unbound
       }
       ParseSampler(in, ch);
       dst.channels[static_cast<size_t>(channel)] = std::move(ch);

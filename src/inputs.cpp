@@ -42,6 +42,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 constexpr const char* kGlesHeader = R"GLSL(#version 300 es
 precision highp float;
 precision highp int;
+precision highp sampler3D;
+precision highp samplerCube;
 #define HW_PERFORMANCE 1
 
 out vec4 _shadertoy_fragColor;
@@ -55,10 +57,6 @@ uniform vec4  iDate;
 uniform float iSampleRate;
 uniform vec3  iChannelResolution[4];
 uniform float iChannelTime[4];
-uniform sampler2D iChannel0;
-uniform sampler2D iChannel1;
-uniform sampler2D iChannel2;
-uniform sampler2D iChannel3;
 )GLSL";
 
 constexpr const char* kGlesFooter = R"GLSL(
@@ -81,10 +79,6 @@ layout(push_constant) uniform _ShadertoyPC {
     vec4  _iTimePack;   // x=iTime y=iTimeDelta z=iFrameRate w=iSampleRate
     ivec4 _iFramePack;  // x=iFrame
 } _stpc;
-layout(set = 0, binding = 0) uniform sampler2D iChannel0;
-layout(set = 0, binding = 1) uniform sampler2D iChannel1;
-layout(set = 0, binding = 2) uniform sampler2D iChannel2;
-layout(set = 0, binding = 3) uniform sampler2D iChannel3;
 #define iResolution (_stpc._iResolution.xyz)
 #define iMouse      (_stpc._iMouse)
 #define iDate       (_stpc._iDate)
@@ -114,12 +108,49 @@ const char* DefaultImageShader() noexcept {
   return kDefaultImageShader;
 }
 
-std::string WrapGles(const std::string& common, const std::string& code) {
-  return std::string(kGlesHeader) + common + "\n" + code + kGlesFooter;
+namespace {
+
+// GLSL sampler type name for a channel's dimensionality.
+const char* SamplerTypeName(SamplerDim d) {
+  switch (d) {
+    case SamplerDim::kCube: return "samplerCube";
+    case SamplerDim::k3D:   return "sampler3D";
+    default:                return "sampler2D";
+  }
 }
 
-std::string WrapVulkan(const std::string& common, const std::string& code) {
-  return std::string(kVulkanHeader) + common + "\n" + code + kVulkanFooter;
+}  // namespace
+
+std::string WrapGles(const std::string& common,
+                     const std::string& code,
+                     const std::array<SamplerDim, 4>& channels) {
+  std::string samplers;
+  for (int i = 0; i < 4; ++i) {
+    samplers += "uniform ";
+    samplers += SamplerTypeName(channels[static_cast<size_t>(i)]);
+    samplers += " iChannel";
+    samplers += static_cast<char>('0' + i);
+    samplers += ";\n";
+  }
+  return std::string(kGlesHeader) + samplers + common + "\n" + code +
+         kGlesFooter;
+}
+
+std::string WrapVulkan(const std::string& common,
+                       const std::string& code,
+                       const std::array<SamplerDim, 4>& channels) {
+  std::string samplers;
+  for (int i = 0; i < 4; ++i) {
+    samplers += "layout(set = 0, binding = ";
+    samplers += static_cast<char>('0' + i);
+    samplers += ") uniform ";
+    samplers += SamplerTypeName(channels[static_cast<size_t>(i)]);
+    samplers += " iChannel";
+    samplers += static_cast<char>('0' + i);
+    samplers += ";\n";
+  }
+  return std::string(kVulkanHeader) + samplers + common + "\n" + code +
+         kVulkanFooter;
 }
 
 std::string LoadShaderFile(const std::string& path) {

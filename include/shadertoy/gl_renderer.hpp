@@ -43,6 +43,13 @@ class GlRenderer {
   /// on failure the previous program is left intact.
   [[nodiscard]] bool SetProgram(const ShaderProgram& program);
 
+  /// Directory holding Shadertoy media (image/cubemap files).  A channel's
+  /// Shadertoy src ("/media/a/<hash>.png") is resolved to <dir>/<hash>.png.
+  /// Defaults to $SHADERTOY_MEDIA_DIR; if unset and no dir is given, the src is
+  /// tried as a literal path.  Cube/texture channels with no resolvable file
+  /// fall back to a black stub.
+  void SetMediaDir(std::string dir) { media_dir_ = std::move(dir); }
+
   /// Draw one frame.  inputs.res_x/res_y must be the destination framebuffer
   /// size; the Image pass renders into the currently bound framebuffer (0).
   void Render(const ShaderInputs& inputs) noexcept;
@@ -71,7 +78,11 @@ class GlRenderer {
                  int target_buffer,
                  PassGL& out);
   GLuint TextureFor(const Channel& ch);
-  GLuint StubTexture();
+  GLuint LoadCubemap(const Channel& ch);  // 6-face GL_TEXTURE_CUBE_MAP
+  GLuint LoadVolume(const Channel& ch);   // 32^3 procedural-noise GL_TEXTURE_3D
+  [[nodiscard]] std::string ResolveMediaPath(const std::string& src) const;
+  GLuint StubTexture();      // 1x1 black GL_TEXTURE_2D
+  GLuint StubTextureCube();  // 1x1x6 black GL_TEXTURE_CUBE_MAP (cubemap fallback)
   void EnsureBuffers(int w, int h);
   void RenderPass(const PassGL& p, const ShaderInputs& in) noexcept;
   void DestroyPass(PassGL& p) noexcept;
@@ -83,8 +94,10 @@ class GlRenderer {
   std::array<BufferGL, kNumBuffers> buffers_{};
   std::array<bool, kNumBuffers> buffer_used_{};
   std::unordered_map<std::string, GLuint> textures_;  // path → GL texture
+  std::string media_dir_;  // base dir for resolving Shadertoy media src paths
   GLuint vao_ = 0;
   GLuint dummy_tex_ = 0;
+  GLuint dummy_cube_ = 0;
   int fb_w_ = 0;
   int fb_h_ = 0;
   bool ready_ = false;

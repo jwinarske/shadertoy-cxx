@@ -8,8 +8,14 @@
 #include "stb_image.h"
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <functional>
+#include <random>
 #include <string>
+#include <vector>
 
 namespace shadertoy {
 
@@ -66,7 +72,16 @@ bool GlRenderer::BuildPass(const std::string& common,
                            const Pass& pass,
                            int target_buffer,
                            PassGL& out) {
-  const std::string fs_src = WrapGles(common, pass.code);
+  std::array<SamplerDim, 4> dims = {SamplerDim::k2D, SamplerDim::k2D,
+                                    SamplerDim::k2D, SamplerDim::k2D};
+  for (int i = 0; i < 4; ++i) {
+    switch (pass.channels[static_cast<size_t>(i)].kind) {
+      case ChannelKind::kCubemap: dims[static_cast<size_t>(i)] = SamplerDim::kCube; break;
+      case ChannelKind::kVolume:  dims[static_cast<size_t>(i)] = SamplerDim::k3D;   break;
+      default: break;
+    }
+  }
+  const std::string fs_src = WrapGles(common, pass.code, dims);
   const GLuint vs = Compile(GL_VERTEX_SHADER, kVertexShader);
   const GLuint fs = Compile(GL_FRAGMENT_SHADER, fs_src.c_str());
   if (vs == 0 || fs == 0) {
@@ -134,6 +149,114 @@ GLuint GlRenderer::StubTexture() {
   return dummy_tex_;
 }
 
+// A complete 1x1x6 black cubemap, bound when a channel's faces can't be loaded
+// so samplerCube shaders still have something valid to sample.
+GLuint GlRenderer::StubTextureCube() {
+  if (dummy_cube_ != 0)
+    return dummy_cube_;
+  glGenTextures(1, &dummy_cube_);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, dummy_cube_);
+  const std::array<GLubyte, 4> black = {0, 0, 0, 255};
+  for (int face = 0; face < 6; ++face)
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), 0,
+                 GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black.data());
+  glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+  return dummy_cube_;
+}
+
+std::string GlRenderer::ResolveMediaPath(const std::string& src) const {
+  // Map a Shadertoy media src ("/media/a/<hash>.png") to a local file by
+  // joining its basename with the media dir.  Without a media dir, return the
+  // src verbatim (caller falls back to a stub if it does not exist).
+  std::string dir = media_dir_;
+  if (dir.empty()) {
+    const char* env = std::getenv("SHADERTOY_MEDIA_DIR");
+    if (env != nullptr)
+      dir = env;
+  }
+  if (dir.empty())
+    return src;
+  const std::filesystem::path p(src);
+  return (std::filesystem::path(dir) / p.filename()).string();
+}
+
+GLuint GlRenderer::LoadCubemap(const Channel& ch) {
+  if (ch.texture_path.empty())
+    return StubTextureCube();
+  const std::string key = "cube:" + ch.texture_path;
+  auto it = textures_.find(key);
+  if (it != textures_.end())
+    return it->second;
+
+  // Face 0 is the src; faces 1..5 are "<stem>_<i><ext>" beside it.
+  const std::filesystem::path base(ResolveMediaPath(ch.texture_path));
+  std::array<std::filesystem::path, 6> faces;
+  faces[0] = base;
+  for (int i = 1; i < 6; ++i)
+    faces[static_cast<size_t>(i)] =
+        base.parent_path() /
+        (base.stem().string() + "_" + std::to_string(i) + base.extension().string());
+
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+  stbi_set_flip_vertically_on_load(0);  // cubemaps are not flipped
+  bool ok = true;
+  for (int i = 0; i < 6 && ok; ++i) {
+    int w = 0, h = 0, comp = 0;
+    stbi_uc* px =
+        stbi_load(faces[static_cast<size_t>(i)].string().c_str(), &w, &h, &comp, 4);
+    if (px == nullptr) {
+      ok = false;
+      break;
+    }
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(i), 0,
+                 GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    stbi_image_free(px);
+  }
+  if (!ok) {
+    glDeleteTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    std::fprintf(stderr, "shadertoy: cubemap %s incomplete (using black)\n",
+                 ch.texture_path.c_str());
+    const GLuint stub = StubTextureCube();
+    textures_[key] = stub;  // cache the fallback so we do not retry every frame
+    return stub;
+  }
+  glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+  textures_[key] = tex;
+  return tex;
+}
+
+GLuint GlRenderer::LoadVolume(const Channel& ch) {
+  // Shadertoy ships no public volume (.bin) format, so synthesise a
+  // deterministic 32^3 RGBA noise volume.  Keyed on the channel src so the same
+  // volume is stable across frames and runs.
+  const std::string key =
+      "vol:" + (ch.texture_path.empty() ? std::string("noise") : ch.texture_path);
+  auto it = textures_.find(key);
+  if (it != textures_.end())
+    return it->second;
+
+  constexpr int kN = 32;
+  std::vector<std::uint8_t> voxels(static_cast<size_t>(kN) * kN * kN * 4);
+  std::mt19937_64 rng(std::hash<std::string>{}(key));
+  std::uniform_int_distribution<int> dist(0, 255);
+  for (auto& v : voxels)
+    v = static_cast<std::uint8_t>(dist(rng));
+
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_3D, tex);
+  glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA, kN, kN, kN, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, voxels.data());
+  glGenerateMipmap(GL_TEXTURE_3D);
+  glBindTexture(GL_TEXTURE_3D, 0);
+  textures_[key] = tex;
+  return tex;
+}
+
 GLuint GlRenderer::TextureFor(const Channel& ch) {
   if (ch.kind != ChannelKind::kTexture || ch.texture_path.empty())
     return StubTexture();
@@ -141,9 +264,10 @@ GLuint GlRenderer::TextureFor(const Channel& ch) {
   if (it != textures_.end())
     return it->second;
 
+  const std::string path = ResolveMediaPath(ch.texture_path);
   stbi_set_flip_vertically_on_load(ch.vflip ? 1 : 0);
   int w = 0, h = 0, comp = 0;
-  stbi_uc* pixels = stbi_load(ch.texture_path.c_str(), &w, &h, &comp, 4);
+  stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
   if (pixels == nullptr) {
     std::fprintf(stderr, "shadertoy: cannot load texture %s (using black)\n",
                  ch.texture_path.c_str());
@@ -221,22 +345,32 @@ void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
   for (int i = 0; i < 4; ++i) {
     const Channel& ch = p.channels[static_cast<size_t>(i)];
     GLuint tex = 0;
+    GLenum target = GL_TEXTURE_2D;
     float rw = 0.0f, rh = 0.0f;
+    auto* self = const_cast<GlRenderer*>(this);
     if (ch.kind == ChannelKind::kBuffer && uses_buffer_internal(ch.buffer)) {
       const BufferGL& src = buffers_[static_cast<size_t>(ch.buffer)];
       tex = src.tex[src.front];  // read previous frame's output
       rw = static_cast<float>(fb_w_);
       rh = static_cast<float>(fb_h_);
     } else if (ch.kind == ChannelKind::kTexture) {
-      tex = const_cast<GlRenderer*>(this)->TextureFor(ch);
+      tex = self->TextureFor(ch);
+    } else if (ch.kind == ChannelKind::kCubemap) {
+      target = GL_TEXTURE_CUBE_MAP;
+      tex = self->LoadCubemap(ch);  // real faces if media present, else black
+      rw = rh = 1.0f;  // avoid divide-by-iChannelResolution NaNs
+    } else if (ch.kind == ChannelKind::kVolume) {
+      target = GL_TEXTURE_3D;
+      tex = self->LoadVolume(ch);  // 32^3 procedural noise
+      rw = rh = 1.0f;
     } else {
-      tex = const_cast<GlRenderer*>(this)->StubTexture();
+      tex = self->StubTexture();
     }
     chan_res[static_cast<size_t>(i) * 3 + 0] = rw;
     chan_res[static_cast<size_t>(i) * 3 + 1] = rh;
     chan_res[static_cast<size_t>(i) * 3 + 2] = 1.0f;
     glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(i));
-    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindTexture(target, tex);
     glBindSampler(static_cast<GLuint>(i), p.samplers[static_cast<size_t>(i)]);
     if (p.loc_channel[static_cast<size_t>(i)] >= 0)
       glUniform1i(p.loc_channel[static_cast<size_t>(i)], i);
@@ -345,13 +479,19 @@ void GlRenderer::Destroy() noexcept {
     buf = BufferGL{};
   }
   for (auto& kv : textures_) {
-    if (kv.second != 0 && kv.second != dummy_tex_)
+    // Skip the shared stubs; they are deleted once, below.
+    if (kv.second != 0 && kv.second != dummy_tex_ &&
+        kv.second != dummy_cube_)
       glDeleteTextures(1, &kv.second);
   }
   textures_.clear();
   if (dummy_tex_) {
     glDeleteTextures(1, &dummy_tex_);
     dummy_tex_ = 0;
+  }
+  if (dummy_cube_) {
+    glDeleteTextures(1, &dummy_cube_);
+    dummy_cube_ = 0;
   }
   if (vao_) {
     glDeleteVertexArrays(1, &vao_);
