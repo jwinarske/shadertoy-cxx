@@ -330,9 +330,17 @@ void GlRenderer::EnsureBuffers(int w, int h) {
 void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
   if (p.target_buffer < 0) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // Shadertoy ignores the Image pass's alpha and always presents an opaque
+    // frame.  Clear the destination alpha to 1 and mask alpha writes so the
+    // compositor never blends the window with whatever is behind it.
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
   } else {
     const BufferGL& buf = buffers_[static_cast<size_t>(p.target_buffer)];
     glBindFramebuffer(GL_FRAMEBUFFER, buf.fbo[1 - buf.front]);  // write to back
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);  // buffers keep their alpha
   }
   glViewport(0, 0, fb_w_, fb_h_);
   glUseProgram(p.program);
@@ -467,6 +475,7 @@ void GlRenderer::Render(const ShaderInputs& inputs) noexcept {
     if (buffer_used_[static_cast<size_t>(b)])
       buffers_[static_cast<size_t>(b)].front ^= 1;
   }
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);  // image pass masked alpha
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
