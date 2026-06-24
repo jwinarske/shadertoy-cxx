@@ -42,6 +42,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 constexpr const char* kGlesHeader = R"GLSL(#version 300 es
 precision highp float;
 precision highp int;
+#define HW_PERFORMANCE 1
+
 out vec4 _shadertoy_fragColor;
 uniform vec3  iResolution;
 uniform float iTime;
