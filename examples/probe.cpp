@@ -20,6 +20,7 @@
 #include <shadertoy/spirv_compile.hpp>
 #endif
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -59,6 +60,45 @@ int ProbeJson(const char* path) {
     if (prog.uses_buffer(b))
       DumpPass(names[b], prog.buffers[static_cast<size_t>(b)]);
   DumpPass("Image", prog.image);
+
+#if SHADERTOY_HAVE_VULKAN
+  // Compile every pass (Common + pass code) to SPIR-V to catch GLSL errors the
+  // JSON loader can't see — a headless proxy for "will it run".
+  int compiled = 0, failed = 0;
+  auto compile_pass = [&](const char* label, const shadertoy::Pass& p) {
+    std::array<shadertoy::SamplerDim, 4> dims = {
+        shadertoy::SamplerDim::k2D, shadertoy::SamplerDim::k2D,
+        shadertoy::SamplerDim::k2D, shadertoy::SamplerDim::k2D};
+    for (int i = 0; i < 4; ++i) {
+      switch (p.channels[static_cast<size_t>(i)].kind) {
+        case shadertoy::ChannelKind::kCubemap:
+          dims[static_cast<size_t>(i)] = shadertoy::SamplerDim::kCube; break;
+        case shadertoy::ChannelKind::kVolume:
+          dims[static_cast<size_t>(i)] = shadertoy::SamplerDim::k3D; break;
+        default: break;
+      }
+    }
+    const std::string vk = shadertoy::WrapVulkan(prog.common, p.code, dims);
+    if (shadertoy::CompileToSpirv(vk, shadertoy::ShaderStage::kFragment)
+            .empty()) {
+      std::fprintf(stderr, "probe: compile %s pass=%s FAILED\n", path, label);
+      ++failed;
+    } else {
+      ++compiled;
+    }
+  };
+  for (int b = 0; b < shadertoy::kNumBuffers; ++b)
+    if (prog.uses_buffer(b))
+      compile_pass(names[b], prog.buffers[static_cast<size_t>(b)]);
+  compile_pass("Image", prog.image);
+  if (failed > 0) {
+    std::fprintf(stderr, "probe: %s %d of %d pass(es) failed to compile\n",
+                 path, failed, compiled + failed);
+    return 2;
+  }
+  std::printf("compiled %d pass(es) to SPIR-V\n", compiled);
+#endif
+
   std::printf("probe: OK\n");
   return 0;
 }
