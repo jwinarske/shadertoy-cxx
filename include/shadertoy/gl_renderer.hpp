@@ -94,6 +94,8 @@ class GlRenderer {
   std::array<BufferGL, kNumBuffers> buffers_{};
   std::array<bool, kNumBuffers> buffer_used_{};
   std::unordered_map<std::string, GLuint> textures_;  // path → GL texture
+  std::unordered_map<GLuint, std::array<float, 3>>
+      tex_dims_;  // GL texture id → iChannelResolution (w,h,depth)
   std::string media_dir_;  // base dir for resolving Shadertoy media src paths
   GLuint vao_ = 0;
   GLuint dummy_tex_ = 0;

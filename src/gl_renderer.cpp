@@ -146,6 +146,7 @@ GLuint GlRenderer::StubTexture() {
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                black.data());
   glBindTexture(GL_TEXTURE_2D, 0);
+  tex_dims_[dummy_tex_] = {1.0f, 1.0f, 1.0f};
   return dummy_tex_;
 }
 
@@ -161,6 +162,7 @@ GLuint GlRenderer::StubTextureCube() {
     glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), 0,
                  GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black.data());
   glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+  tex_dims_[dummy_cube_] = {1.0f, 1.0f, 1.0f};
   return dummy_cube_;
 }
 
@@ -202,6 +204,7 @@ GLuint GlRenderer::LoadCubemap(const Channel& ch) {
   glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
   stbi_set_flip_vertically_on_load(0);  // cubemaps are not flipped
   bool ok = true;
+  int face_w = 1, face_h = 1;
   for (int i = 0; i < 6 && ok; ++i) {
     int w = 0, h = 0, comp = 0;
     stbi_uc* px =
@@ -210,6 +213,8 @@ GLuint GlRenderer::LoadCubemap(const Channel& ch) {
       ok = false;
       break;
     }
+    face_w = w;
+    face_h = h;
     glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(i), 0,
                  GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
     stbi_image_free(px);
@@ -225,6 +230,7 @@ GLuint GlRenderer::LoadCubemap(const Channel& ch) {
   }
   glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
   glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+  tex_dims_[tex] = {static_cast<float>(face_w), static_cast<float>(face_h), 1.0f};
   textures_[key] = tex;
   return tex;
 }
@@ -253,6 +259,8 @@ GLuint GlRenderer::LoadVolume(const Channel& ch) {
                GL_UNSIGNED_BYTE, voxels.data());
   glGenerateMipmap(GL_TEXTURE_3D);
   glBindTexture(GL_TEXTURE_3D, 0);
+  tex_dims_[tex] = {static_cast<float>(kN), static_cast<float>(kN),
+                    static_cast<float>(kN)};
   textures_[key] = tex;
   return tex;
 }
@@ -282,6 +290,7 @@ GLuint GlRenderer::TextureFor(const Channel& ch) {
   glGenerateMipmap(GL_TEXTURE_2D);
   glBindTexture(GL_TEXTURE_2D, 0);
   stbi_image_free(pixels);
+  tex_dims_[tex] = {static_cast<float>(w), static_cast<float>(h), 1.0f};
   textures_[ch.texture_path] = tex;
   return tex;
 }
@@ -346,29 +355,35 @@ void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
     const Channel& ch = p.channels[static_cast<size_t>(i)];
     GLuint tex = 0;
     GLenum target = GL_TEXTURE_2D;
-    float rw = 0.0f, rh = 0.0f;
+    float rw = 1.0f, rh = 1.0f, rz = 1.0f;  // iChannelResolution (avoid /0)
     auto* self = const_cast<GlRenderer*>(this);
     if (ch.kind == ChannelKind::kBuffer && uses_buffer_internal(ch.buffer)) {
       const BufferGL& src = buffers_[static_cast<size_t>(ch.buffer)];
       tex = src.tex[src.front];  // read previous frame's output
       rw = static_cast<float>(fb_w_);
       rh = static_cast<float>(fb_h_);
-    } else if (ch.kind == ChannelKind::kTexture) {
-      tex = self->TextureFor(ch);
-    } else if (ch.kind == ChannelKind::kCubemap) {
-      target = GL_TEXTURE_CUBE_MAP;
-      tex = self->LoadCubemap(ch);  // real faces if media present, else black
-      rw = rh = 1.0f;  // avoid divide-by-iChannelResolution NaNs
-    } else if (ch.kind == ChannelKind::kVolume) {
-      target = GL_TEXTURE_3D;
-      tex = self->LoadVolume(ch);  // 32^3 procedural noise
-      rw = rh = 1.0f;
     } else {
-      tex = self->StubTexture();
+      if (ch.kind == ChannelKind::kTexture) {
+        tex = self->TextureFor(ch);
+      } else if (ch.kind == ChannelKind::kCubemap) {
+        target = GL_TEXTURE_CUBE_MAP;
+        tex = self->LoadCubemap(ch);  // real faces if media present, else black
+      } else if (ch.kind == ChannelKind::kVolume) {
+        target = GL_TEXTURE_3D;
+        tex = self->LoadVolume(ch);  // 32^3 procedural noise
+      } else {
+        tex = self->StubTexture();
+      }
+      const auto it = tex_dims_.find(tex);
+      if (it != tex_dims_.end()) {
+        rw = it->second[0];
+        rh = it->second[1];
+        rz = it->second[2];
+      }
     }
     chan_res[static_cast<size_t>(i) * 3 + 0] = rw;
     chan_res[static_cast<size_t>(i) * 3 + 1] = rh;
-    chan_res[static_cast<size_t>(i) * 3 + 2] = 1.0f;
+    chan_res[static_cast<size_t>(i) * 3 + 2] = rz;
     glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(i));
     glBindTexture(target, tex);
     glBindSampler(static_cast<GLuint>(i), p.samplers[static_cast<size_t>(i)]);
@@ -485,6 +500,7 @@ void GlRenderer::Destroy() noexcept {
       glDeleteTextures(1, &kv.second);
   }
   textures_.clear();
+  tex_dims_.clear();
   if (dummy_tex_) {
     glDeleteTextures(1, &dummy_tex_);
     dummy_tex_ = 0;
