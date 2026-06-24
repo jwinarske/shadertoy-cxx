@@ -95,12 +95,16 @@ if(HAVE_VULKAN)
        include/shadertoy/vk_renderer.hpp)
 endif()
 
-add_library(shadertoy SHARED ${SHADERTOY_SOURCES})
+# No explicit SHARED: honor BUILD_SHARED_LIBS so the library can be built either
+# way (default static). POSITION_INDEPENDENT_CODE keeps a static build linkable
+# into a PIE executable.
+add_library(shadertoy ${SHADERTOY_SOURCES})
 add_library(shadertoy-cxx::shadertoy ALIAS shadertoy)
 
 set_target_properties(shadertoy PROPERTIES
     VERSION   ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
+    POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET default)
 
 target_include_directories(shadertoy PUBLIC
