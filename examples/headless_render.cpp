@@ -17,6 +17,7 @@
 #include <shadertoy/loader.hpp>
 #include <shadertoy/program.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -24,9 +25,10 @@
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr,
-                 "usage: %s <shader.json> <out.ppm> [media_dir] [W H frames time]\n",
-                 argv[0]);
+    std::fprintf(
+        stderr,
+        "usage: %s <shader.json> <out.ppm> [media_dir] [W H frames time]\n",
+        argv[0]);
     return 2;
   }
   const char* json = argv[1];
@@ -34,7 +36,8 @@ int main(int argc, char** argv) {
   const std::string media = argc > 3 ? argv[3] : "";
   const int W = argc > 5 ? std::atoi(argv[4]) : 800;
   const int H = argc > 5 ? std::atoi(argv[5]) : 450;
-  const int frames = argc > 6 ? std::atoi(argv[6]) : 8;   // a few, so feedback settles
+  const int frames =
+      argc > 6 ? std::atoi(argv[6]) : 8;  // a few, so feedback settles
   const float t = argc > 7 ? static_cast<float>(std::atof(argv[7])) : 6.0f;
 
   EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -43,10 +46,19 @@ int main(int argc, char** argv) {
     return 1;
   }
   eglBindAPI(EGL_OPENGL_ES_API);
-  const EGLint cfg_attr[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-                             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-                             EGL_ALPHA_SIZE, 8, EGL_NONE};
+  const EGLint cfg_attr[] = {EGL_SURFACE_TYPE,
+                             EGL_PBUFFER_BIT,
+                             EGL_RENDERABLE_TYPE,
+                             EGL_OPENGL_ES2_BIT,
+                             EGL_RED_SIZE,
+                             8,
+                             EGL_GREEN_SIZE,
+                             8,
+                             EGL_BLUE_SIZE,
+                             8,
+                             EGL_ALPHA_SIZE,
+                             8,
+                             EGL_NONE};
   EGLConfig cfg;
   EGLint n = 0;
   if (!eglChooseConfig(dpy, cfg_attr, &cfg, 1, &n) || n == 0) {
@@ -83,6 +95,8 @@ int main(int argc, char** argv) {
   in.res_x = static_cast<float>(W);
   in.res_y = static_cast<float>(H);
   in.res_z = 1.0f;
+  glFinish();  // drain setup before timing the frame loop
+  const auto t0 = std::chrono::steady_clock::now();
   for (int f = 0; f < frames; ++f) {
     in.frame = f;
     in.time = t * static_cast<float>(f + 1) / static_cast<float>(frames);
@@ -91,6 +105,12 @@ int main(int argc, char** argv) {
     glViewport(0, 0, W, H);
     renderer.Render(in);
   }
+  glFinish();
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  std::fprintf(stderr, "render: %.2f ms/frame over %d frame(s) at %dx%d\n",
+               ms / frames, frames, W, H);
 
   std::vector<unsigned char> px(static_cast<size_t>(W) * H * 4);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
