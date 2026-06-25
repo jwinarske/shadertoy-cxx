@@ -25,6 +25,8 @@ enum class ChannelKind {
   kTexture,   // a 2D image file
   kKeyboard,  // 256x3 keyboard state texture (stubbed: all zero)
   kAudio,     // 512x2 audio FFT/waveform texture (stubbed: all zero)
+  kCubemap,   // samplerCube; six faces from the media dir, else black
+  kVolume,    // sampler3D;  procedural 32^3 noise (no public volume format)
 };
 
 enum class Filter { kNearest, kLinear, kMipmap };
