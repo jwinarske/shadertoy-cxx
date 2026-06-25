@@ -67,6 +67,20 @@ path). ALSA opens the `default` capture device, overridable with
 device entirely with `GlRenderer::SetAudioSource()` or suppress capture with
 `GlRenderer::SetAudioEnabled(false)`.
 
+By default each PipeWire mic source opens its own connection (context, core, and
+thread loop). An app that already runs a PipeWire thread loop — typically because
+it also drives video (camera/screen) streams — can instead create the source on
+its own loop and core via `<shadertoy/audio_pipewire.hpp>`:
+
+```cpp
+#include <shadertoy/audio_pipewire.hpp>
+// app owns `loop` (started) and `core`; the source makes a pw_stream on them
+auto mic = shadertoy::MakePipeWireMicSource(loop, core);
+```
+
+so every audio and video stream in the process rides a single daemon connection
+and a single thread, instead of one connection per source.
+
 > The Vulkan back-end currently renders single-pass Image shaders; multi-pass on
 > Vulkan is in progress. The OpenGL ES 3 back-end is fully multi-pass. Live audio
 > capture is wired into the GL back-end (the real-time path); the Vulkan back-end

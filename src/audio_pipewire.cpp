@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 shadertoy-cxx contributors
 //
-// audio_pipewire.cpp — PipeWire microphone capture back-end.
+// audio_pipewire.cpp — PipeWire microphone capture backend.
 //
 // Compiled only when libpipewire-0.3 is available (SHADERTOY_HAVE_PIPEWIRE).
-// Captures mono float PCM from the default audio source on a private PipeWire
-// thread loop and feeds it into PcmAudioSource's ring; the render thread reads
-// the analyzed texture through Fill().
+// Captures mono float PCM from the default audio source and feeds it into
+// PcmAudioSource's ring; the render thread reads the analyzed texture through
+// Fill().
+//
+// Two ownership modes share one stream-setup path:
+//   * owned  — the source creates its own pw_thread_loop + pw_context + pw_core
+//              (MakePipeWireMicSource()); correct for a standalone single mic.
+//   * shared — the source attaches to an app-owned loop + core and creates only
+//              a pw_stream on it (MakePipeWireMicSource(loop, core), declared
+//              in <shadertoy/audio_pipewire.hpp>), so many audio (and video)
+//              streams ride one daemon connection and one thread.
 
+#include "shadertoy/audio_pipewire.hpp"
 #include "audio_internal.hpp"
 
 #include <pipewire/pipewire.h>
@@ -22,6 +31,9 @@ namespace {
 
 class PipeWireMicSource final : public PcmAudioSource {
  public:
+  PipeWireMicSource() = default;                          // owned mode
+  PipeWireMicSource(pw_thread_loop* loop, pw_core* core)  // shared mode
+      : ext_loop_(loop), ext_core_(core) {}
   ~PipeWireMicSource() override { Stop(); }
 
   bool Start() override;
@@ -32,10 +44,24 @@ class PipeWireMicSource final : public PcmAudioSource {
   static void OnProcess(void* data);
 
  private:
+  bool
+  CreateStream();  // stream new + listener + connect (caller holds the lock)
+
+  // Active handles (point at owned objects, or at the injected loop/core).
   pw_thread_loop* loop_ = nullptr;
+  pw_core* core_ = nullptr;
   pw_stream* stream_ = nullptr;
-  uint32_t channels_ = 1;  // negotiated channel count (set on the PW thread)
+  spa_hook listener_{};
+
+  // Owned-mode objects (null in shared mode).
+  pw_context* context_ = nullptr;
   bool pw_inited_ = false;
+
+  // Injected (not owned); non-null selects shared mode.
+  pw_thread_loop* ext_loop_ = nullptr;
+  pw_core* ext_core_ = nullptr;
+
+  uint32_t channels_ = 1;  // negotiated channel count (set on the PW thread)
 };
 
 const pw_stream_events& StreamEvents() {
@@ -96,28 +122,14 @@ void PipeWireMicSource::OnProcess(void* data) {
   pw_stream_queue_buffer(self->stream_, b);
 }
 
-bool PipeWireMicSource::Start() {
-  if (stream_ != nullptr)
-    return true;  // already running
-
-  pw_init(nullptr, nullptr);
-  pw_inited_ = true;
-
-  loop_ = pw_thread_loop_new("shadertoy-mic", nullptr);
-  if (loop_ == nullptr) {
-    Stop();
-    return false;
-  }
-
+bool PipeWireMicSource::CreateStream() {
   pw_properties* props =
       pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY,
                         "Capture", PW_KEY_MEDIA_ROLE, "Music", nullptr);
-  stream_ = pw_stream_new_simple(pw_thread_loop_get_loop(loop_),
-                                 "shadertoy-mic", props, &StreamEvents(), this);
-  if (stream_ == nullptr) {
-    Stop();
+  stream_ = pw_stream_new(core_, "shadertoy-mic", props);  // consumes props
+  if (stream_ == nullptr)
     return false;
-  }
+  pw_stream_add_listener(stream_, &listener_, &StreamEvents(), this);
 
   uint8_t pod_buf[1024];
   spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
@@ -133,14 +145,42 @@ bool PipeWireMicSource::Start() {
   // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   const auto flags = static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT |
                                                   PW_STREAM_FLAG_MAP_BUFFERS);
-  const int rc = pw_stream_connect(stream_, PW_DIRECTION_INPUT, PW_ID_ANY,
-                                   flags, params, 1);
-  if (rc < 0) {
-    Stop();
-    return false;
+  return pw_stream_connect(stream_, PW_DIRECTION_INPUT, PW_ID_ANY, flags,
+                           params, 1) >= 0;
+}
+
+bool PipeWireMicSource::Start() {
+  if (stream_ != nullptr)
+    return true;  // already running
+
+  if (ext_loop_ != nullptr) {
+    // Shared: ride the app-owned loop + core (the app started the loop).
+    loop_ = ext_loop_;
+    core_ = ext_core_;
+  } else {
+    // Owned: stand up a private connection and start its thread loop.
+    pw_init(nullptr, nullptr);
+    pw_inited_ = true;
+    loop_ = pw_thread_loop_new("shadertoy-mic", nullptr);
+    if (loop_ == nullptr) {
+      Stop();
+      return false;
+    }
+    context_ = pw_context_new(pw_thread_loop_get_loop(loop_), nullptr, 0);
+    if (context_ == nullptr || pw_thread_loop_start(loop_) < 0) {
+      Stop();
+      return false;
+    }
   }
 
-  if (pw_thread_loop_start(loop_) < 0) {
+  // Stream creation (and, when owned, the core connect) must run under the loop
+  // lock since the loop is now running.
+  pw_thread_loop_lock(loop_);
+  if (core_ == nullptr)
+    core_ = pw_context_connect(context_, nullptr, 0);
+  const bool ok = core_ != nullptr && CreateStream();
+  pw_thread_loop_unlock(loop_);
+  if (!ok) {
     Stop();
     return false;
   }
@@ -148,11 +188,33 @@ bool PipeWireMicSource::Start() {
 }
 
 void PipeWireMicSource::Stop() noexcept {
+  if (ext_loop_ != nullptr) {
+    // Shared: tear down only our stream; the app owns loop/core.
+    if (stream_ != nullptr) {
+      pw_thread_loop_lock(loop_);
+      pw_stream_destroy(stream_);
+      pw_thread_loop_unlock(loop_);
+      stream_ = nullptr;
+    }
+    loop_ = nullptr;
+    core_ = nullptr;
+    return;
+  }
+
+  // Owned: stop the loop, then tear the connection down (no lock once stopped).
   if (loop_ != nullptr)
     pw_thread_loop_stop(loop_);
   if (stream_ != nullptr) {
     pw_stream_destroy(stream_);
     stream_ = nullptr;
+  }
+  if (core_ != nullptr) {
+    pw_core_disconnect(core_);
+    core_ = nullptr;
+  }
+  if (context_ != nullptr) {
+    pw_context_destroy(context_);
+    context_ = nullptr;
   }
   if (loop_ != nullptr) {
     pw_thread_loop_destroy(loop_);
@@ -168,6 +230,13 @@ void PipeWireMicSource::Stop() noexcept {
 
 std::unique_ptr<AudioSource> MakePipeWireMicSource() {
   return std::make_unique<PipeWireMicSource>();
+}
+
+std::unique_ptr<AudioSource> MakePipeWireMicSource(pw_thread_loop* loop,
+                                                   pw_core* core) {
+  if (loop == nullptr || core == nullptr)
+    return nullptr;
+  return std::make_unique<PipeWireMicSource>(loop, core);
 }
 
 }  // namespace shadertoy

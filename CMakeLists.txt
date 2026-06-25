@@ -134,6 +134,7 @@ endif()
 if(HAVE_PIPEWIRE)
   # The PipeWire capture back-end; audio.cpp (core) provides the DSP + selector.
   list(APPEND SHADERTOY_SOURCES src/audio_pipewire.cpp)
+  list(APPEND SHADERTOY_PUBLIC_HEADERS include/shadertoy/audio_pipewire.hpp)
 endif()
 if(HAVE_ALSA)
   # The ALSA capture back-end (works headless without a PipeWire daemon).

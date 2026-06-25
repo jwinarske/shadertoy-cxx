@@ -137,6 +137,9 @@ if have_vulkan
         subdir: 'shadertoy',
     )
 endif
+if have_pipewire
+    install_headers('include/shadertoy/audio_pipewire.hpp', subdir: 'shadertoy')
+endif
 # config.hpp is installed by include/shadertoy/meson.build.
 
 # ── pkg-config for downstream consumers ───────────────────────────────────────
