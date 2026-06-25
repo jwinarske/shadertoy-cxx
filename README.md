@@ -67,6 +67,14 @@ path). ALSA opens the `default` capture device, overridable with
 device entirely with `GlRenderer::SetAudioSource()` or suppress capture with
 `GlRenderer::SetAudioEnabled(false)`.
 
+`SetAudioSource()` takes a `shared_ptr`, so one capture can be fanned out to
+several renderers — pass the same source to each and they share a single capture
+and a single FFT (the analysis is computed once per capture batch and copied to
+every consumer; `AudioSource::Fill()` is thread-safe). The caller owns an
+injected source's lifecycle (`Start()` before rendering, `Stop()` when done); the
+renderer only reads it. The lazily created default microphone is instead started
+and stopped by the renderer.
+
 By default each PipeWire mic source opens its own connection (context, core, and
 thread loop). An app that already runs a PipeWire thread loop — typically because
 it also drives video (camera/screen) streams — can instead create the source on

@@ -59,8 +59,14 @@ class GlRenderer {
   /// Provide a custom audio input for kAudio channels (e.g. a non-microphone
   /// source).  Overrides the default microphone source; pass nullptr to disable
   /// audio entirely (kAudio channels fall back to a silent black texture).
-  /// Takes ownership.
-  void SetAudioSource(std::unique_ptr<AudioSource> src) noexcept;
+  ///
+  /// Shared ownership: pass the same source to several renderers to fan one
+  /// capture (and one FFT) out to all of them.  The caller owns the lifecycle
+  /// of an injected source — call AudioSource::Start() before rendering and
+  /// Stop() when done; the renderer only reads it (Fill) and never starts or
+  /// stops it. The lazily created default microphone (used when no source is
+  /// set) is instead started and stopped by the renderer.
+  void SetAudioSource(std::shared_ptr<AudioSource> src) noexcept;
 
   /// Enable/disable the default microphone capture used for kAudio channels
   /// when no custom source was set (default enabled).  Disable for privacy or
@@ -116,7 +122,7 @@ class GlRenderer {
   GLuint dummy_tex_ = 0;
   GLuint dummy_cube_ = 0;
   GLuint audio_tex_ = 0;  // 512x2 R8 FFT/waveform texture (0 until audio runs)
-  std::unique_ptr<AudioSource> audio_;  // mic (or custom) capture source
+  std::shared_ptr<AudioSource> audio_;  // mic (or custom) capture source
   bool audio_enabled_ = true;           // allow default mic creation
   bool audio_custom_set_ = false;  // a source was provided via SetAudioSource
   bool audio_started_ = false;     // source->Start() succeeded

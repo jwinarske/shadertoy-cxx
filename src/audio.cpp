@@ -71,10 +71,21 @@ bool PcmAudioSource::Fill(unsigned char* dst) noexcept {
   static_assert(kBins == kAudioTexWidth,
                 "FFT bin count must match texture row");
 
-  // Snapshot the latest kFftSize samples under the lock (cheap copy).
+  // Fan-out: many consumers share one capture and one FFT.  analysis_mu_
+  // serialises the analysis and the cache; the transform runs only when new
+  // samples have arrived since the last call, so extra consumers in the same
+  // capture window just copy the cached texture instead of recomputing it.
+  std::lock_guard<std::mutex> analysis(analysis_mu_);
+
   std::vector<float> re(kFftSize), im(kFftSize, 0.0f);
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (analyzed_once_ && write_ == analyzed_at_) {
+      std::memcpy(dst, cached_.data(), kAudioTexBytes);  // no new audio
+      return true;
+    }
+    analyzed_at_ = write_;
+    // Snapshot the latest kFftSize samples while holding the ring lock.
     const std::size_t avail = std::min<std::size_t>(write_, kFftSize);
     const std::size_t start = write_ - avail;  // oldest of the window
     for (int i = 0; i < kFftSize; ++i) {
@@ -87,12 +98,13 @@ bool PcmAudioSource::Fill(unsigned char* dst) noexcept {
     }
   }
 
-  // Waveform row (row 1): map [-1,1] to a byte centred at 128, like Web Audio's
-  // getByteTimeDomainData.  Use the most recent kBins samples.
+  // Waveform row (row 1): map [-1,1] to a byte centered at 128, like Web
+  // Audio's getByteTimeDomainData.  Use the most recent kBins samples.
   for (int i = 0; i < kBins; ++i) {
     const float s = re[static_cast<std::size_t>(kFftSize - kBins + i)];
     const float v = 128.0f + 128.0f * s;
-    dst[kBins + i] = static_cast<unsigned char>(std::clamp(v, 0.0f, 255.0f));
+    cached_[static_cast<std::size_t>(kBins + i)] =
+        static_cast<unsigned char>(std::clamp(v, 0.0f, 255.0f));
   }
 
   // Blackman window before the transform (Web Audio's default), then FFT.
@@ -119,8 +131,11 @@ bool PcmAudioSource::Fill(unsigned char* dst) noexcept {
     sm = kTau * sm + (1.0f - kTau) * mag;
     const float db = 20.0f * std::log10(sm > 1e-9f ? sm : 1e-9f);
     const float v = scale * (db - kMinDb);
-    dst[i] = static_cast<unsigned char>(std::clamp(v, 0.0f, 255.0f));
+    cached_[static_cast<std::size_t>(i)] =
+        static_cast<unsigned char>(std::clamp(v, 0.0f, 255.0f));
   }
+  analyzed_once_ = true;
+  std::memcpy(dst, cached_.data(), kAudioTexBytes);
   return true;
 }
 

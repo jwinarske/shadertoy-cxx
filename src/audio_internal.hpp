@@ -16,6 +16,7 @@
 
 #include <shadertoy/config.hpp>
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -43,11 +44,18 @@ class PcmAudioSource : public AudioSource {
   static constexpr std::size_t kRingSize = 1u
                                            << 12;  // recent-sample ring (pow2)
 
-  std::mutex mu_;
+  std::mutex mu_;            // guards the ring (capture thread vs Fill)
   std::vector<float> ring_;  // kRingSize mono samples, circular
   std::size_t write_ = 0;    // total samples ever written (monotonic)
+
+  // Analysis cache, guarded by analysis_mu_ so concurrent Fill() callers share
+  // one FFT: recomputed only when write_ advances past analyzed_at_.
+  std::mutex analysis_mu_;
   std::vector<float>
       smooth_;  // per-bin time-smoothed magnitude (linear domain)
+  std::array<unsigned char, kAudioTexBytes> cached_{};  // last 512x2 texture
+  std::size_t analyzed_at_ = 0;  // write_ value the cache was computed at
+  bool analyzed_once_ = false;   // cache holds a valid texture
 };
 
 // Per-back-end factories (each compiled only with its dependency).
