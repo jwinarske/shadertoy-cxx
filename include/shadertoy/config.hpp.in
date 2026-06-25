@@ -28,6 +28,16 @@
 // 1 when the Shadertoy JSON loader (loader.hpp) is available, else 0.
 #define SHADERTOY_HAVE_JSON @SHADERTOY_HAVE_JSON@
 
+// 1 when the PipeWire microphone capture back-end (audio.hpp MakeMicSource) is
+// available, else 0.
+#define SHADERTOY_HAVE_PIPEWIRE @SHADERTOY_HAVE_PIPEWIRE@
+
+// 1 when the ALSA microphone capture back-end is available, else 0.  When
+// neither audio back-end is compiled in, MakeMicSource() returns nullptr and
+// kAudio channels render as a silent black texture.  When both are present,
+// MakeMicSource() prefers PipeWire unless $SHADERTOY_AUDIO_BACKEND selects one.
+#define SHADERTOY_HAVE_ALSA @SHADERTOY_HAVE_ALSA@
+
 // Install location of the bundled shader set (overridable at runtime via the
 // SHADERTOY_SHADER_DIR environment variable; see shadertoy::DefaultShaderDir).
 #define SHADERTOY_SHADER_DIR "@SHADERTOY_SHADER_DIR@"

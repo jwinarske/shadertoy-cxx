@@ -25,8 +25,14 @@ include(CMakePackageConfigHelpers)
 # OFF   = exclude it
 set(SHADERTOY_GL "AUTO" CACHE STRING "OpenGL ES 3.0 back-end: AUTO, ON, or OFF")
 set(SHADERTOY_VULKAN "AUTO" CACHE STRING "Vulkan back-end: AUTO, ON, or OFF")
+set(SHADERTOY_PIPEWIRE "AUTO"
+    CACHE STRING "PipeWire mic-capture audio back-end: AUTO, ON, or OFF")
+set(SHADERTOY_ALSA "AUTO"
+    CACHE STRING "ALSA mic-capture audio back-end: AUTO, ON, or OFF")
 set_property(CACHE SHADERTOY_GL PROPERTY STRINGS AUTO ON OFF)
 set_property(CACHE SHADERTOY_VULKAN PROPERTY STRINGS AUTO ON OFF)
+set_property(CACHE SHADERTOY_PIPEWIRE PROPERTY STRINGS AUTO ON OFF)
+set_property(CACHE SHADERTOY_ALSA PROPERTY STRINGS AUTO ON OFF)
 option(SHADERTOY_BUILD_EXAMPLES "Build the standalone offscreen example" OFF)
 
 find_package(PkgConfig QUIET)
@@ -55,6 +61,33 @@ if(NOT SHADERTOY_VULKAN STREQUAL "OFF")
   endif()
 endif()
 
+# PipeWire mic capture (libpipewire-0.3 via pkg-config) — optional, gated.
+set(HAVE_PIPEWIRE 0)
+if(NOT SHADERTOY_PIPEWIRE STREQUAL "OFF")
+  if(PkgConfig_FOUND)
+    pkg_check_modules(PIPEWIRE IMPORTED_TARGET libpipewire-0.3)
+  endif()
+  if(PIPEWIRE_FOUND)
+    set(HAVE_PIPEWIRE 1)
+  elseif(SHADERTOY_PIPEWIRE STREQUAL "ON")
+    message(FATAL_ERROR
+      "SHADERTOY_PIPEWIRE=ON but libpipewire-0.3 (pkg-config) was not found")
+  endif()
+endif()
+
+# ALSA mic capture (libasound via pkg-config) — optional, gated.
+set(HAVE_ALSA 0)
+if(NOT SHADERTOY_ALSA STREQUAL "OFF")
+  if(PkgConfig_FOUND)
+    pkg_check_modules(ALSA IMPORTED_TARGET alsa)
+  endif()
+  if(ALSA_FOUND)
+    set(HAVE_ALSA 1)
+  elseif(SHADERTOY_ALSA STREQUAL "ON")
+    message(FATAL_ERROR "SHADERTOY_ALSA=ON but alsa (pkg-config) was not found")
+  endif()
+endif()
+
 # ── Generated config header ───────────────────────────────────────────────────
 set(SHADERTOY_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(SHADERTOY_VERSION_MINOR ${PROJECT_VERSION_MINOR})
@@ -62,6 +95,8 @@ set(SHADERTOY_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 set(SHADERTOY_VERSION_STRING ${PROJECT_VERSION})
 set(SHADERTOY_HAVE_GL ${HAVE_GL})
 set(SHADERTOY_HAVE_VULKAN ${HAVE_VULKAN})
+set(SHADERTOY_HAVE_PIPEWIRE ${HAVE_PIPEWIRE})
+set(SHADERTOY_HAVE_ALSA ${HAVE_ALSA})
 set(SHADERTOY_HAVE_JSON 1)  # loader uses the vendored nlohmann/json
 set(SHADERTOY_SHADER_DIR ${CMAKE_INSTALL_FULL_DATADIR}/shadertoy-cxx/shaders)
 configure_file(
@@ -75,12 +110,14 @@ set(SHADERTOY_SOURCES
     src/inputs.cpp
     src/program.cpp
     src/loader.cpp
-    src/playlist.cpp)
+    src/playlist.cpp
+    src/audio.cpp)
 set(SHADERTOY_PUBLIC_HEADERS
     include/shadertoy/inputs.hpp
     include/shadertoy/program.hpp
     include/shadertoy/loader.hpp
     include/shadertoy/playlist.hpp
+    include/shadertoy/audio.hpp
     ${CMAKE_CURRENT_BINARY_DIR}/include/shadertoy/config.hpp)
 
 if(HAVE_GL)
@@ -93,6 +130,14 @@ if(HAVE_VULKAN)
   list(APPEND SHADERTOY_PUBLIC_HEADERS
        include/shadertoy/spirv_compile.hpp
        include/shadertoy/vk_renderer.hpp)
+endif()
+if(HAVE_PIPEWIRE)
+  # The PipeWire capture back-end; audio.cpp (core) provides the DSP + selector.
+  list(APPEND SHADERTOY_SOURCES src/audio_pipewire.cpp)
+endif()
+if(HAVE_ALSA)
+  # The ALSA capture back-end (works headless without a PipeWire daemon).
+  list(APPEND SHADERTOY_SOURCES src/audio_alsa.cpp)
 endif()
 
 # No explicit SHARED: honor BUILD_SHARED_LIBS so the library can be built either
@@ -123,9 +168,18 @@ endif()
 if(HAVE_VULKAN)
   target_link_libraries(shadertoy PUBLIC Vulkan::Vulkan)
 endif()
+if(HAVE_PIPEWIRE)
+  # PRIVATE: PipeWire is an implementation detail, absent from public headers.
+  target_link_libraries(shadertoy PRIVATE PkgConfig::PIPEWIRE)
+endif()
+if(HAVE_ALSA)
+  target_link_libraries(shadertoy PRIVATE PkgConfig::ALSA)
+endif()
 
 message(STATUS "shadertoy-cxx: OpenGL ES 3 back-end: ${HAVE_GL}")
 message(STATUS "shadertoy-cxx: Vulkan back-end:      ${HAVE_VULKAN}")
+message(STATUS "shadertoy-cxx: PipeWire mic capture: ${HAVE_PIPEWIRE}")
+message(STATUS "shadertoy-cxx: ALSA mic capture:     ${HAVE_ALSA}")
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS shadertoy
@@ -174,6 +228,16 @@ if(HAVE_VULKAN)
   string(APPEND SHADERTOY_PC_REQUIRES "vulkan ")
 endif()
 string(STRIP "${SHADERTOY_PC_REQUIRES}" SHADERTOY_PC_REQUIRES)
+
+# PipeWire links privately (not in public headers): Requires.private only.
+set(SHADERTOY_PC_REQUIRES_PRIVATE "")
+if(HAVE_PIPEWIRE)
+  string(APPEND SHADERTOY_PC_REQUIRES_PRIVATE "libpipewire-0.3 ")
+endif()
+if(HAVE_ALSA)
+  string(APPEND SHADERTOY_PC_REQUIRES_PRIVATE "alsa ")
+endif()
+string(STRIP "${SHADERTOY_PC_REQUIRES_PRIVATE}" SHADERTOY_PC_REQUIRES_PRIVATE)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/shadertoy-cxx.pc.in
     ${CMAKE_CURRENT_BINARY_DIR}/shadertoy-cxx.pc

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
 option('gl',       type: 'feature', value: 'auto', description: 'OpenGL ES 3.0 render back-end (libglesv2)')
 option('vulkan',   type: 'feature', value: 'auto', description: 'Vulkan render back-end (libvulkan)')
+option('pipewire', type: 'feature', value: 'auto', description: 'PipeWire mic-capture audio back-end (libpipewire-0.3)')
+option('alsa',     type: 'feature', value: 'auto', description: 'ALSA mic-capture audio back-end (libasound)')
 option('examples', type: 'boolean', value: false,  description: 'Build the standalone offscreen example')

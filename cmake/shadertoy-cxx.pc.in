@@ -7,5 +7,6 @@ Name: shadertoy-cxx
 Description: Platform-agnostic Shadertoy renderer (OpenGL ES 3 + Vulkan)
 Version: @PROJECT_VERSION@
 Requires: @SHADERTOY_PC_REQUIRES@
+Requires.private: @SHADERTOY_PC_REQUIRES_PRIVATE@
 Libs: -L${libdir} -lshadertoy
 Cflags: -I${includedir}
