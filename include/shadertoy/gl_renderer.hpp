@@ -18,10 +18,12 @@
 #include <GLES3/gl3.h>
 
 #include <array>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "shadertoy/audio.hpp"
 #include "shadertoy/inputs.hpp"
 #include "shadertoy/program.hpp"
 
@@ -54,6 +56,17 @@ class GlRenderer {
   /// size; the Image pass renders into the currently bound framebuffer (0).
   void Render(const ShaderInputs& inputs) noexcept;
 
+  /// Provide a custom audio input for kAudio channels (e.g. a non-microphone
+  /// source).  Overrides the default microphone source; pass nullptr to disable
+  /// audio entirely (kAudio channels fall back to a silent black texture).
+  /// Takes ownership.
+  void SetAudioSource(std::unique_ptr<AudioSource> src) noexcept;
+
+  /// Enable/disable the default microphone capture used for kAudio channels
+  /// when no custom source was set (default enabled).  Disable for privacy or
+  /// headless runs.  No effect once SetAudioSource has been called.
+  void SetAudioEnabled(bool enabled) noexcept { audio_enabled_ = enabled; }
+
   void Destroy() noexcept;
 
  private:
@@ -81,8 +94,10 @@ class GlRenderer {
   GLuint LoadCubemap(const Channel& ch);  // 6-face GL_TEXTURE_CUBE_MAP
   GLuint LoadVolume(const Channel& ch);   // 32^3 procedural-noise GL_TEXTURE_3D
   [[nodiscard]] std::string ResolveMediaPath(const std::string& src) const;
-  GLuint StubTexture();      // 1x1 black GL_TEXTURE_2D
-  GLuint StubTextureCube();  // 1x1x6 black GL_TEXTURE_CUBE_MAP (cubemap fallback)
+  GLuint StubTexture();  // 1x1 black GL_TEXTURE_2D
+  GLuint
+  StubTextureCube();  // 1x1x6 black GL_TEXTURE_CUBE_MAP (cubemap fallback)
+  void UpdateAudio(const ShaderInputs& in) noexcept;  // capture → audio texture
   void EnsureBuffers(int w, int h);
   void RenderPass(const PassGL& p, const ShaderInputs& in) noexcept;
   void DestroyPass(PassGL& p) noexcept;
@@ -95,11 +110,20 @@ class GlRenderer {
   std::array<bool, kNumBuffers> buffer_used_{};
   std::unordered_map<std::string, GLuint> textures_;  // path → GL texture
   std::unordered_map<GLuint, std::array<float, 3>>
-      tex_dims_;  // GL texture id → iChannelResolution (w,h,depth)
+      tex_dims_;           // GL texture id → iChannelResolution (w,h,depth)
   std::string media_dir_;  // base dir for resolving Shadertoy media src paths
   GLuint vao_ = 0;
   GLuint dummy_tex_ = 0;
   GLuint dummy_cube_ = 0;
+  GLuint audio_tex_ = 0;  // 512x2 R8 FFT/waveform texture (0 until audio runs)
+  std::unique_ptr<AudioSource> audio_;  // mic (or custom) capture source
+  bool audio_enabled_ = true;           // allow default mic creation
+  bool audio_custom_set_ = false;  // a source was provided via SetAudioSource
+  bool audio_started_ = false;     // source->Start() succeeded
+  bool audio_failed_ =
+      false;  // open failed; latched off to avoid per-frame retry
+  bool uses_audio_ = false;  // current program binds a kAudio channel
+  int audio_frame_ = -1;     // last frame the audio texture was uploaded
   int fb_w_ = 0;
   int fb_h_ = 0;
   bool ready_ = false;

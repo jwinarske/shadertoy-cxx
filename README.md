@@ -44,12 +44,47 @@ glRenderer.SetProgram(prog);   // buffers + common + texture channels
 ```
 
 Channel support: **buffer** and **texture** (image files, via stb_image) are
-rendered; **keyboard** and **audio** channels are stubbed to a black/zero
-texture (shaders compile and run, just without that input). Cubemap/volume/video
-inputs are unsupported.
+rendered. **audio** channels (`mic`/`musicstream`) feed a live 512×2 FFT +
+waveform texture when an audio back-end is compiled in (see below); without one
+they — like **keyboard** channels — fall back to a black/zero texture (shaders
+still compile and run, just without that input). Cubemap and volume channels
+render (six-face cubemaps from the media dir; a procedural noise volume);
+video/webcam inputs are unsupported.
+
+Two mic-capture back-ends are available, each gated like the renderers:
+
+| Back-end | Dependency | Meson | CMake | `config.hpp` |
+|----------|------------|-------|-------|--------------|
+| PipeWire | `libpipewire-0.3` | `-Dpipewire=enabled\|disabled` | `-DSHADERTOY_PIPEWIRE=ON\|OFF` | `SHADERTOY_HAVE_PIPEWIRE` |
+| ALSA     | `libasound` (`alsa`) | `-Dalsa=enabled\|disabled` | `-DSHADERTOY_ALSA=ON\|OFF` | `SHADERTOY_HAVE_ALSA` |
+
+The GL renderer lazily opens the default microphone the first time a shader
+samples an audio channel. When both back-ends are compiled in, PipeWire is used
+by default; set `SHADERTOY_AUDIO_BACKEND=pipewire|alsa|none` to choose (handy on
+headless systems with no running PipeWire daemon, where ALSA is the working
+path). ALSA opens the `default` capture device, overridable with
+`SHADERTOY_ALSA_DEVICE` (e.g. `plughw:CARD=CODEC,DEV=0`). Hosts can override the
+device entirely with `GlRenderer::SetAudioSource()` or suppress capture with
+`GlRenderer::SetAudioEnabled(false)`.
+
+By default each PipeWire mic source opens its own connection (context, core, and
+thread loop). An app that already runs a PipeWire thread loop — typically because
+it also drives video (camera/screen) streams — can instead create the source on
+its own loop and core via `<shadertoy/audio_pipewire.hpp>`:
+
+```cpp
+#include <shadertoy/audio_pipewire.hpp>
+// app owns `loop` (started) and `core`; the source makes a pw_stream on them
+auto mic = shadertoy::MakePipeWireMicSource(loop, core);
+```
+
+so every audio and video stream in the process rides a single daemon connection
+and a single thread, instead of one connection per source.
 
 > The Vulkan back-end currently renders single-pass Image shaders; multi-pass on
-> Vulkan is in progress. The OpenGL ES 3 back-end is fully multi-pass.
+> Vulkan is in progress. The OpenGL ES 3 back-end is fully multi-pass. Live audio
+> capture is wired into the GL back-end (the real-time path); the Vulkan back-end
+> still stubs audio channels.
 
 ## Layout
 

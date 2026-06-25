@@ -31,9 +31,13 @@ void main() {
 
 GLint MinFilter(Filter f) {
   switch (f) {
-    case Filter::kNearest: return GL_NEAREST;
-    case Filter::kMipmap: return GL_LINEAR_MIPMAP_LINEAR;
-    case Filter::kLinear: default: return GL_LINEAR;
+    case Filter::kNearest:
+      return GL_NEAREST;
+    case Filter::kMipmap:
+      return GL_LINEAR_MIPMAP_LINEAR;
+    case Filter::kLinear:
+    default:
+      return GL_LINEAR;
   }
 }
 GLint MagFilter(Filter f) {
@@ -76,17 +80,24 @@ bool GlRenderer::BuildPass(const std::string& common,
                                     SamplerDim::k2D, SamplerDim::k2D};
   for (int i = 0; i < 4; ++i) {
     switch (pass.channels[static_cast<size_t>(i)].kind) {
-      case ChannelKind::kCubemap: dims[static_cast<size_t>(i)] = SamplerDim::kCube; break;
-      case ChannelKind::kVolume:  dims[static_cast<size_t>(i)] = SamplerDim::k3D;   break;
-      default: break;
+      case ChannelKind::kCubemap:
+        dims[static_cast<size_t>(i)] = SamplerDim::kCube;
+        break;
+      case ChannelKind::kVolume:
+        dims[static_cast<size_t>(i)] = SamplerDim::k3D;
+        break;
+      default:
+        break;
     }
   }
   const std::string fs_src = WrapGles(common, pass.code, dims);
   const GLuint vs = Compile(GL_VERTEX_SHADER, kVertexShader);
   const GLuint fs = Compile(GL_FRAGMENT_SHADER, fs_src.c_str());
   if (vs == 0 || fs == 0) {
-    if (vs) glDeleteShader(vs);
-    if (fs) glDeleteShader(fs);
+    if (vs)
+      glDeleteShader(vs);
+    if (fs)
+      glDeleteShader(fs);
     return false;
   }
   const GLuint program = glCreateProgram();
@@ -166,6 +177,59 @@ GLuint GlRenderer::StubTextureCube() {
   return dummy_cube_;
 }
 
+void GlRenderer::SetAudioSource(std::unique_ptr<AudioSource> src) noexcept {
+  if (audio_ && audio_started_)
+    audio_->Stop();
+  audio_ = std::move(src);
+  audio_custom_set_ = true;
+  audio_started_ = false;
+  audio_failed_ = false;
+  audio_frame_ = -1;
+}
+
+void GlRenderer::UpdateAudio(const ShaderInputs& in) noexcept {
+  if (!uses_audio_ || audio_failed_)
+    return;  // audio_failed_ latches a failed open so we retry at most once
+  // Lazily create the default microphone source the first time audio is needed.
+  if (audio_ == nullptr) {
+    if (audio_custom_set_ || !audio_enabled_)
+      return;  // explicitly disabled, or a null custom source was set
+    audio_ = MakeMicSource();
+    if (audio_ == nullptr) {
+      audio_failed_ = true;
+      return;  // no capture back-end compiled in (kAudio stays a black stub)
+    }
+  }
+  if (!audio_started_) {
+    if (!audio_->Start()) {
+      audio_.reset();
+      audio_failed_ = true;  // no device/permission: give up, do not retry
+      return;
+    }
+    audio_started_ = true;
+  }
+  if (in.frame == audio_frame_)
+    return;  // already uploaded this frame (multiple passes may sample audio)
+  audio_frame_ = in.frame;
+
+  unsigned char px[kAudioTexBytes];
+  if (!audio_->Fill(px))
+    return;
+  if (audio_tex_ == 0) {
+    glGenTextures(1, &audio_tex_);
+    glBindTexture(GL_TEXTURE_2D, audio_tex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, kAudioTexWidth, 2, 0, GL_RED,
+                 GL_UNSIGNED_BYTE, nullptr);
+    tex_dims_[audio_tex_] = {static_cast<float>(kAudioTexWidth), 2.0f, 1.0f};
+  } else {
+    glBindTexture(GL_TEXTURE_2D, audio_tex_);
+  }
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kAudioTexWidth, 2, GL_RED,
+                  GL_UNSIGNED_BYTE, px);
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 std::string GlRenderer::ResolveMediaPath(const std::string& src) const {
   // Map a Shadertoy media src ("/media/a/<hash>.png") to a local file by
   // joining its basename with the media dir.  Without a media dir, return the
@@ -196,8 +260,8 @@ GLuint GlRenderer::LoadCubemap(const Channel& ch) {
   faces[0] = base;
   for (int i = 1; i < 6; ++i)
     faces[static_cast<size_t>(i)] =
-        base.parent_path() /
-        (base.stem().string() + "_" + std::to_string(i) + base.extension().string());
+        base.parent_path() / (base.stem().string() + "_" + std::to_string(i) +
+                              base.extension().string());
 
   GLuint tex = 0;
   glGenTextures(1, &tex);
@@ -207,8 +271,8 @@ GLuint GlRenderer::LoadCubemap(const Channel& ch) {
   int face_w = 1, face_h = 1;
   for (int i = 0; i < 6 && ok; ++i) {
     int w = 0, h = 0, comp = 0;
-    stbi_uc* px =
-        stbi_load(faces[static_cast<size_t>(i)].string().c_str(), &w, &h, &comp, 4);
+    stbi_uc* px = stbi_load(faces[static_cast<size_t>(i)].string().c_str(), &w,
+                            &h, &comp, 4);
     if (px == nullptr) {
       ok = false;
       break;
@@ -230,7 +294,8 @@ GLuint GlRenderer::LoadCubemap(const Channel& ch) {
   }
   glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
   glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
-  tex_dims_[tex] = {static_cast<float>(face_w), static_cast<float>(face_h), 1.0f};
+  tex_dims_[tex] = {static_cast<float>(face_w), static_cast<float>(face_h),
+                    1.0f};
   textures_[key] = tex;
   return tex;
 }
@@ -240,7 +305,8 @@ GLuint GlRenderer::LoadVolume(const Channel& ch) {
   // deterministic 32^3 RGBA noise volume.  Keyed on the channel src so the same
   // volume is stable across frames and runs.
   const std::string key =
-      "vol:" + (ch.texture_path.empty() ? std::string("noise") : ch.texture_path);
+      "vol:" +
+      (ch.texture_path.empty() ? std::string("noise") : ch.texture_path);
   auto it = textures_.find(key);
   if (it != textures_.end())
     return it->second;
@@ -308,9 +374,10 @@ void GlRenderer::EnsureBuffers(int w, int h) {
       if (buf.tex[i] == 0)
         glGenTextures(1, &buf.tex[i]);
       glBindTexture(GL_TEXTURE_2D, buf.tex[i]);
-      // RGBA16F: filterable in core ES3, renderable with EXT_color_buffer_float.
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT,
-                   nullptr);
+      // RGBA16F: filterable in core ES3, renderable with
+      // EXT_color_buffer_float.
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA,
+                   GL_HALF_FLOAT, nullptr);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       if (buf.fbo[i] == 0)
@@ -340,7 +407,8 @@ void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
   } else {
     const BufferGL& buf = buffers_[static_cast<size_t>(p.target_buffer)];
     glBindFramebuffer(GL_FRAMEBUFFER, buf.fbo[1 - buf.front]);  // write to back
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);  // buffers keep their alpha
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE,
+                GL_TRUE);  // buffers keep their alpha
   }
   glViewport(0, 0, fb_w_, fb_h_);
   glUseProgram(p.program);
@@ -348,15 +416,20 @@ void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
   if (p.loc_resolution >= 0)
     glUniform3f(p.loc_resolution, static_cast<float>(fb_w_),
                 static_cast<float>(fb_h_), 1.0f);
-  if (p.loc_time >= 0) glUniform1f(p.loc_time, in.time);
-  if (p.loc_time_delta >= 0) glUniform1f(p.loc_time_delta, in.time_delta);
-  if (p.loc_frame_rate >= 0) glUniform1f(p.loc_frame_rate, in.frame_rate);
-  if (p.loc_frame >= 0) glUniform1i(p.loc_frame, in.frame);
+  if (p.loc_time >= 0)
+    glUniform1f(p.loc_time, in.time);
+  if (p.loc_time_delta >= 0)
+    glUniform1f(p.loc_time_delta, in.time_delta);
+  if (p.loc_frame_rate >= 0)
+    glUniform1f(p.loc_frame_rate, in.frame_rate);
+  if (p.loc_frame >= 0)
+    glUniform1i(p.loc_frame, in.frame);
   if (p.loc_mouse >= 0)
     glUniform4f(p.loc_mouse, in.mouse_x, in.mouse_y, in.mouse_z, in.mouse_w);
   if (p.loc_date >= 0)
     glUniform4f(p.loc_date, in.date_y, in.date_m, in.date_d, in.date_s);
-  if (p.loc_sample_rate >= 0) glUniform1f(p.loc_sample_rate, in.sample_rate);
+  if (p.loc_sample_rate >= 0)
+    glUniform1f(p.loc_sample_rate, in.sample_rate);
 
   std::array<float, 12> chan_res{};
   for (int i = 0; i < 4; ++i) {
@@ -379,8 +452,10 @@ void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
       } else if (ch.kind == ChannelKind::kVolume) {
         target = GL_TEXTURE_3D;
         tex = self->LoadVolume(ch);  // 32^3 procedural noise
+      } else if (ch.kind == ChannelKind::kAudio && audio_tex_ != 0) {
+        tex = audio_tex_;  // live FFT/waveform (UpdateAudio ran this frame)
       } else {
-        tex = self->StubTexture();
+        tex = self->StubTexture();  // keyboard / silent audio / unbound
       }
       const auto it = tex_dims_.find(tex);
       if (it != tex_dims_.end()) {
@@ -445,6 +520,26 @@ bool GlRenderer::SetProgram(const ShaderProgram& program) {
   image_pass_ = std::move(new_image);
   buffer_used_ = used;
 
+  // Does any pass sample an audio channel?  Drives lazy mic capture in Render.
+  uses_audio_ = false;
+  auto pass_uses_audio = [](const Pass& p) {
+    for (const Channel& c : p.channels)
+      if (c.kind == ChannelKind::kAudio)
+        return true;
+    return false;
+  };
+  uses_audio_ = pass_uses_audio(program.image);
+  for (int b = 0; b < kNumBuffers && !uses_audio_; ++b)
+    if (program.uses_buffer(b))
+      uses_audio_ = pass_uses_audio(program.buffers[static_cast<size_t>(b)]);
+  // Release the microphone when switching to a shader that does not use it.
+  if (!uses_audio_ && audio_ && audio_started_) {
+    audio_->Stop();
+    audio_started_ = false;
+  }
+  audio_failed_ = false;  // re-attempt the device for the new program
+  audio_frame_ = -1;
+
   // Force buffer (re)allocation on the next Render.
   fb_w_ = 0;
   fb_h_ = 0;
@@ -464,6 +559,8 @@ void GlRenderer::Render(const ShaderInputs& inputs) noexcept {
   if (w <= 0 || h <= 0)
     return;
   EnsureBuffers(w, h);
+  UpdateAudio(
+      inputs);  // capture → audio_tex_ (once per frame; no-op if unused)
 
   // All passes read buffers' front (previous frame) and write to backs; swap
   // once at the end (Shadertoy double-buffer semantics).
@@ -497,15 +594,16 @@ void GlRenderer::Destroy() noexcept {
   DestroyPass(image_pass_);
   for (BufferGL& buf : buffers_) {
     for (int i = 0; i < 2; ++i) {
-      if (buf.tex[i]) glDeleteTextures(1, &buf.tex[i]);
-      if (buf.fbo[i]) glDeleteFramebuffers(1, &buf.fbo[i]);
+      if (buf.tex[i])
+        glDeleteTextures(1, &buf.tex[i]);
+      if (buf.fbo[i])
+        glDeleteFramebuffers(1, &buf.fbo[i]);
     }
     buf = BufferGL{};
   }
   for (auto& kv : textures_) {
     // Skip the shared stubs; they are deleted once, below.
-    if (kv.second != 0 && kv.second != dummy_tex_ &&
-        kv.second != dummy_cube_)
+    if (kv.second != 0 && kv.second != dummy_tex_ && kv.second != dummy_cube_)
       glDeleteTextures(1, &kv.second);
   }
   textures_.clear();
@@ -518,6 +616,16 @@ void GlRenderer::Destroy() noexcept {
     glDeleteTextures(1, &dummy_cube_);
     dummy_cube_ = 0;
   }
+  if (audio_tex_) {
+    glDeleteTextures(1, &audio_tex_);
+    audio_tex_ = 0;
+  }
+  if (audio_ && audio_started_)
+    audio_->Stop();
+  audio_started_ = false;
+  audio_failed_ = false;
+  uses_audio_ = false;
+  audio_frame_ = -1;
   if (vao_) {
     glDeleteVertexArrays(1, &vao_);
     vao_ = 0;

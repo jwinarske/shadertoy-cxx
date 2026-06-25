@@ -20,11 +20,15 @@ project(
 # -Dgl=disabled / -Dvulkan=disabled to force a build that excludes one (or both)
 # back-end — the library then ships only the platform-agnostic core.
 
-glesv2_dep = dependency('glesv2', required: get_option('gl'))
-vulkan_dep = dependency('vulkan', required: get_option('vulkan'))
+glesv2_dep   = dependency('glesv2', required: get_option('gl'))
+vulkan_dep   = dependency('vulkan', required: get_option('vulkan'))
+pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'))
+alsa_dep     = dependency('alsa', required: get_option('alsa'))
 
-have_gl     = glesv2_dep.found()
-have_vulkan = vulkan_dep.found()
+have_gl       = glesv2_dep.found()
+have_vulkan   = vulkan_dep.found()
+have_pipewire = pipewire_dep.found()
+have_alsa     = alsa_dep.found()
 
 # ── Generated config header (include/shadertoy/config.hpp) ────────────────────
 
@@ -34,9 +38,11 @@ conf.set('SHADERTOY_VERSION_MAJOR',  ver[0])
 conf.set('SHADERTOY_VERSION_MINOR',  ver[1])
 conf.set('SHADERTOY_VERSION_PATCH',  ver[2])
 conf.set('SHADERTOY_VERSION_STRING', meson.project_version())
-conf.set('SHADERTOY_HAVE_GL',     have_gl     ? '1' : '0')
-conf.set('SHADERTOY_HAVE_VULKAN', have_vulkan ? '1' : '0')
-conf.set('SHADERTOY_HAVE_JSON',   '1')   # loader uses the vendored nlohmann/json
+conf.set('SHADERTOY_HAVE_GL',       have_gl       ? '1' : '0')
+conf.set('SHADERTOY_HAVE_VULKAN',   have_vulkan   ? '1' : '0')
+conf.set('SHADERTOY_HAVE_PIPEWIRE', have_pipewire ? '1' : '0')
+conf.set('SHADERTOY_HAVE_ALSA',     have_alsa     ? '1' : '0')
+conf.set('SHADERTOY_HAVE_JSON',     '1')   # loader uses the vendored nlohmann/json
 shader_install_dir = get_option('prefix') / get_option('datadir') / 'shadertoy-cxx' / 'shaders'
 conf.set('SHADERTOY_SHADER_DIR',  shader_install_dir)
 
@@ -53,7 +59,7 @@ private_inc = include_directories('third_party/stb', 'third_party')
 # the source-wrapping helpers are always present.
 
 sources = ['src/inputs.cpp', 'src/program.cpp', 'src/loader.cpp',
-           'src/playlist.cpp']
+           'src/playlist.cpp', 'src/audio.cpp']
 deps    = []
 pc_requires = []
 
@@ -68,6 +74,22 @@ if have_vulkan
     sources += ['src/spirv_compile.cpp', 'src/vk_renderer.cpp']
     deps    += vulkan_dep
     pc_requires += 'vulkan'
+endif
+
+pc_requires_private = []
+if have_pipewire
+    # PipeWire capture back-end; audio.cpp (core) provides the DSP + selector.
+    # Private: it is an implementation detail, absent from the public headers.
+    sources += ['src/audio_pipewire.cpp']
+    deps    += pipewire_dep
+    pc_requires_private += 'libpipewire-0.3'
+endif
+
+if have_alsa
+    # ALSA capture back-end (works headless without a PipeWire daemon).
+    sources += ['src/audio_alsa.cpp']
+    deps    += alsa_dep
+    pc_requires_private += 'alsa'
 endif
 
 # ── Shared library ────────────────────────────────────────────────────────────
@@ -90,6 +112,7 @@ install_headers(
     'include/shadertoy/program.hpp',
     'include/shadertoy/loader.hpp',
     'include/shadertoy/playlist.hpp',
+    'include/shadertoy/audio.hpp',
     subdir: 'shadertoy',
 )
 
@@ -114,6 +137,9 @@ if have_vulkan
         subdir: 'shadertoy',
     )
 endif
+if have_pipewire
+    install_headers('include/shadertoy/audio_pipewire.hpp', subdir: 'shadertoy')
+endif
 # config.hpp is installed by include/shadertoy/meson.build.
 
 # ── pkg-config for downstream consumers ───────────────────────────────────────
@@ -123,8 +149,9 @@ pkg.generate(
     shadertoy_lib,
     name:        'shadertoy-cxx',
     description: 'Platform-agnostic Shadertoy renderer (OpenGL ES 3 + Vulkan)',
-    subdirs:     [],
-    requires:    pc_requires,
+    subdirs:          [],
+    requires:         pc_requires,
+    requires_private: pc_requires_private,
 )
 
 # ── Dependency object for use as a Meson subproject ───────────────────────────
@@ -139,6 +166,8 @@ meson.override_dependency('shadertoy-cxx', shadertoy_dep)
 summary({
     'OpenGL ES 3 back-end': have_gl,
     'Vulkan back-end':      have_vulkan,
+    'PipeWire mic capture': have_pipewire,
+    'ALSA mic capture':     have_alsa,
 }, section: 'shadertoy-cxx back-ends')
 
 # ── Examples (optional, off by default) ───────────────────────────────────────
