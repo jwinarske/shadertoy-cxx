@@ -177,8 +177,10 @@ GLuint GlRenderer::StubTextureCube() {
   return dummy_cube_;
 }
 
-void GlRenderer::SetAudioSource(std::unique_ptr<AudioSource> src) noexcept {
-  if (audio_ && audio_started_)
+void GlRenderer::SetAudioSource(std::shared_ptr<AudioSource> src) noexcept {
+  // Only stop the source we own (the lazily created default), never an injected
+  // one the caller (and possibly other renderers) still owns.
+  if (audio_ && audio_started_ && !audio_custom_set_)
     audio_->Stop();
   audio_ = std::move(src);
   audio_custom_set_ = true;
@@ -200,7 +202,9 @@ void GlRenderer::UpdateAudio(const ShaderInputs& in) noexcept {
       return;  // no capture back-end compiled in (kAudio stays a black stub)
     }
   }
-  if (!audio_started_) {
+  // The renderer manages only the lazily created default source; an injected
+  // (possibly shared) source is started and stopped by the caller.
+  if (!audio_custom_set_ && !audio_started_) {
     if (!audio_->Start()) {
       audio_.reset();
       audio_failed_ = true;  // no device/permission: give up, do not retry
@@ -532,8 +536,9 @@ bool GlRenderer::SetProgram(const ShaderProgram& program) {
   for (int b = 0; b < kNumBuffers && !uses_audio_; ++b)
     if (program.uses_buffer(b))
       uses_audio_ = pass_uses_audio(program.buffers[static_cast<size_t>(b)]);
-  // Release the microphone when switching to a shader that does not use it.
-  if (!uses_audio_ && audio_ && audio_started_) {
+  // Release the microphone when switching to a shader that does not use it
+  // (only the source we own; an injected one is the caller's to manage).
+  if (!uses_audio_ && audio_ && audio_started_ && !audio_custom_set_) {
     audio_->Stop();
     audio_started_ = false;
   }
@@ -620,10 +625,12 @@ void GlRenderer::Destroy() noexcept {
     glDeleteTextures(1, &audio_tex_);
     audio_tex_ = 0;
   }
-  if (audio_ && audio_started_)
-    audio_->Stop();
+  if (audio_ && audio_started_ && !audio_custom_set_)
+    audio_->Stop();  // an injected source is the caller's to stop
+  audio_.reset();
   audio_started_ = false;
   audio_failed_ = false;
+  audio_custom_set_ = false;
   uses_audio_ = false;
   audio_frame_ = -1;
   if (vao_) {
