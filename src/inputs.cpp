@@ -5,8 +5,10 @@
 
 #include "shadertoy/inputs.hpp"
 
+#include <cctype>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 
 namespace shadertoy {
 
@@ -35,7 +37,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 }
 )GLSL";
 
-// ── GLSL preambles ────────────────────────────────────────────────────────────
+// ── GLSL preambles
+// ────────────────────────────────────────────────────────────
 
 // OpenGL ES 3.0 (EGL back-end).  gl_FragCoord origin is bottom-left, matching
 // Shadertoy, so fragCoord is passed straight through.
@@ -113,10 +116,55 @@ namespace {
 // GLSL sampler type name for a channel's dimensionality.
 const char* SamplerTypeName(SamplerDim d) {
   switch (d) {
-    case SamplerDim::kCube: return "samplerCube";
-    case SamplerDim::k3D:   return "sampler3D";
-    default:                return "sampler2D";
+    case SamplerDim::kCube:
+      return "samplerCube";
+    case SamplerDim::k3D:
+      return "sampler3D";
+    default:
+      return "sampler2D";
   }
+}
+
+// GLSL ES reserves a set of words "for future use".  Shaders authored against
+// desktop GL or WebGL2 sometimes use them as ordinary identifiers (e.g. a local
+// named `sample` or `packed`), which the ES compiler rejects outright.  These
+// words have no legal use in a GLSL ES shader body, so any occurrence is a
+// stray identifier; rename every whole-identifier occurrence to a non-colliding
+// form. Renaming *all* occurrences (declarations and uses alike) keeps the
+// shader consistent and semantically unchanged.  Qualifiers like `in`/`out` are
+// NOT listed — they have valid uses and cannot be blindly renamed.
+std::string SanitizeReservedIdentifiers(const std::string& src) {
+  static constexpr std::string_view kReserved[] = {
+      "sample", "packed", "filter", "active", "partition", "superp"};
+  const auto is_ident = [](unsigned char c) {
+    return std::isalnum(c) != 0 || c == '_';
+  };
+  std::string out;
+  out.reserve(src.size() + 32);
+  std::size_t i = 0;
+  while (i < src.size()) {
+    const auto c = static_cast<unsigned char>(src[i]);
+    // Scan a full identifier from its start so substrings (mySample, sample2D,
+    // _sample) never match; non-identifier bytes are copied verbatim.
+    if (std::isalpha(c) != 0 || c == '_') {
+      std::size_t j = i + 1;
+      while (j < src.size() && is_ident(static_cast<unsigned char>(src[j])))
+        ++j;
+      const std::string_view word(src.data() + i, j - i);
+      out.append(word);
+      for (const std::string_view reserved : kReserved) {
+        if (word == reserved) {
+          out.push_back('_');
+          break;
+        }
+      }
+      i = j;
+    } else {
+      out.push_back(src[i]);
+      ++i;
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -132,8 +180,9 @@ std::string WrapGles(const std::string& common,
     samplers += static_cast<char>('0' + i);
     samplers += ";\n";
   }
-  return std::string(kGlesHeader) + samplers + common + "\n" + code +
-         kGlesFooter;
+  return std::string(kGlesHeader) + samplers +
+         SanitizeReservedIdentifiers(common) + "\n" +
+         SanitizeReservedIdentifiers(code) + kGlesFooter;
 }
 
 std::string WrapVulkan(const std::string& common,
@@ -149,8 +198,9 @@ std::string WrapVulkan(const std::string& common,
     samplers += static_cast<char>('0' + i);
     samplers += ";\n";
   }
-  return std::string(kVulkanHeader) + samplers + common + "\n" + code +
-         kVulkanFooter;
+  return std::string(kVulkanHeader) + samplers +
+         SanitizeReservedIdentifiers(common) + "\n" +
+         SanitizeReservedIdentifiers(code) + kVulkanFooter;
 }
 
 std::string LoadShaderFile(const std::string& path) {
