@@ -2,8 +2,16 @@
 // Copyright (c) 2026 shadertoy-cxx contributors
 //
 // spirv_compile.cpp — runtime GLSL→SPIR-V via glslangValidator / glslc.
+//
+// Always compiled. When the build also links glslang (SHADERTOY_GLSLANG_LINK),
+// CompileToSpirv prefers that and this path remains as the escape hatch
+// SHADERTOY_GLSLANG selects: a deployment may want a distro-managed compiler it
+// can update without rebuilding, and an image may ship the tool without its
+// development files.
 
 #include "shadertoy/spirv_compile.hpp"
+
+#include "spirv_compile_backend.hpp"
 
 extern "C" {
 #include <sys/wait.h>
@@ -19,6 +27,19 @@ extern "C" {
 #include <vector>
 
 namespace shadertoy {
+
+#if !SHADERTOY_HAVE_GLSLANG_LIB
+// No compiler linked into this build: the subprocess path is the only one.
+// Defined here rather than behind a weak symbol so a build that wires up
+// neither backend fails to link instead of silently returning nothing.
+bool HaveLinkedSpirvCompiler() {
+  return false;
+}
+std::vector<uint32_t> CompileToSpirvLinked(const std::string& /*glsl_source*/,
+                                           ShaderStage /*stage*/) {
+  return {};
+}
+#endif
 
 namespace {
 
@@ -90,6 +111,18 @@ namespace {
 
 std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
                                      ShaderStage stage) {
+  // SHADERTOY_GLSLANG names a binary, so setting it is a deliberate request for
+  // the subprocess path -- the escape hatch that lets a deployment swap the
+  // compiler without rebuilding, and the reason the linked backend is an option
+  // rather than a replacement.
+  const char* override_bin = std::getenv("SHADERTOY_GLSLANG");
+  if (HaveLinkedSpirvCompiler() &&
+      (override_bin == nullptr || *override_bin == '\0')) {
+    // Authoritative when present: a failure here is the shader's, and retrying
+    // it through a subprocess would only report the same error twice.
+    return CompileToSpirvLinked(glsl_source, stage);
+  }
+
   const char* tmpdir_env = std::getenv("TMPDIR");
   const std::string tmpdir = (tmpdir_env && *tmpdir_env) ? tmpdir_env : "/tmp";
 
@@ -110,8 +143,6 @@ std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
     ::unlink(in_path.c_str());
     return {};
   }
-
-  const char* override_bin = std::getenv("SHADERTOY_GLSLANG");
 
   std::vector<uint32_t> spirv;
   auto try_glslang = [&](const char* prog) -> bool {
