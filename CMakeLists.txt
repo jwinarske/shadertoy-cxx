@@ -50,6 +50,20 @@ if(NOT SHADERTOY_GL STREQUAL "OFF")
   endif()
 endif()
 
+# Link glslang instead of shelling out to glslangValidator/glslc.
+#
+# Optional on purpose. Linking removes a runtime dependency from the target
+# image, which matters because a missing compiler shows up only on the device,
+# at the first shader, as a view that renders nothing. Shelling out is still
+# worth keeping: it leaves the compiler swappable without rebuilding this
+# library, and works on an image that ships the tool but not its development
+# files. AUTO links when glslang is found; ON demands it; OFF keeps the
+# subprocess path alone. The SHADERTOY_GLSLANG env override selects the
+# subprocess path at runtime regardless.
+set(SHADERTOY_GLSLANG_LINK "AUTO" CACHE STRING
+    "Link glslang for GLSL->SPIR-V: AUTO, ON, or OFF")
+set_property(CACHE SHADERTOY_GLSLANG_LINK PROPERTY STRINGS AUTO ON OFF)
+
 # Vulkan.
 set(HAVE_VULKAN 0)
 if(NOT SHADERTOY_VULKAN STREQUAL "OFF")
@@ -58,6 +72,28 @@ if(NOT SHADERTOY_VULKAN STREQUAL "OFF")
     set(HAVE_VULKAN 1)
   elseif(SHADERTOY_VULKAN STREQUAL "ON")
     message(FATAL_ERROR "SHADERTOY_VULKAN=ON but Vulkan was not found")
+  endif()
+endif()
+
+# glslang, for the linked compiler. Only meaningful on a Vulkan build: the GL
+# renderer hands GLSL to the driver and never needs SPIR-V.
+set(HAVE_GLSLANG_LIB 0)
+if(HAVE_VULKAN AND NOT SHADERTOY_GLSLANG_LINK STREQUAL "OFF")
+  find_package(glslang CONFIG QUIET)
+  if(glslang_FOUND AND TARGET glslang::glslang AND
+     TARGET glslang::glslang-default-resource-limits)
+    set(HAVE_GLSLANG_LIB 1)
+    message(STATUS "shadertoy-cxx: linking glslang for GLSL->SPIR-V")
+  elseif(SHADERTOY_GLSLANG_LINK STREQUAL "ON")
+    message(FATAL_ERROR
+            "SHADERTOY_GLSLANG_LINK=ON but glslang (with "
+            "glslang-default-resource-limits) was not found. Install the "
+            "glslang development package, or pass OFF to use the "
+            "glslangValidator/glslc subprocess path instead.")
+  else()
+    message(STATUS
+            "shadertoy-cxx: glslang not found; GLSL->SPIR-V will shell out to "
+            "glslangValidator/glslc, which must then exist on the target")
   endif()
 endif()
 
@@ -128,6 +164,9 @@ endif()
 if(HAVE_VULKAN)
   list(APPEND SHADERTOY_SOURCES src/spirv_compile.cpp src/vk_renderer.cpp
        src/vk_offscreen_renderer.cpp)
+  if(HAVE_GLSLANG_LIB)
+    list(APPEND SHADERTOY_SOURCES src/spirv_compile_glslang.cpp)
+  endif()
   list(APPEND SHADERTOY_PUBLIC_HEADERS
        include/shadertoy/spirv_compile.hpp
        include/shadertoy/vk_renderer.hpp
@@ -170,6 +209,17 @@ if(HAVE_GL)
 endif()
 if(HAVE_VULKAN)
   target_link_libraries(shadertoy PUBLIC Vulkan::Vulkan)
+endif()
+# PRIVATE: glslang is an implementation detail of CompileToSpirv, and the
+# define drives which translation unit supplies the backend stubs, so consumers
+# neither link it nor need to agree on it.
+if(HAVE_GLSLANG_LIB)
+  target_link_libraries(shadertoy PRIVATE
+                        glslang::glslang
+                        glslang::glslang-default-resource-limits)
+  target_compile_definitions(shadertoy PRIVATE SHADERTOY_HAVE_GLSLANG_LIB=1)
+else()
+  target_compile_definitions(shadertoy PRIVATE SHADERTOY_HAVE_GLSLANG_LIB=0)
 endif()
 if(HAVE_PIPEWIRE)
   # PRIVATE: PipeWire is an implementation detail, absent from public headers.
