@@ -24,3 +24,14 @@ if egl_dep.found() and glesv2_dep.found()
         install:      false,
     )
 endif
+
+# Vulkan offscreen renderer — targets a caller-owned image on a caller-owned
+# device, so it needs no surface and no compositor.
+if vulkan_dep.found()
+    executable(
+        'vk_offscreen_render',
+        'vk_offscreen_render.cpp',
+        dependencies: [shadertoy_dep, vulkan_dep],
+        install:      false,
+    )
+endif

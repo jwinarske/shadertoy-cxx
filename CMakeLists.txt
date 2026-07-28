@@ -126,10 +126,12 @@ if(HAVE_GL)
   list(APPEND SHADERTOY_PUBLIC_HEADERS include/shadertoy/gl_renderer.hpp)
 endif()
 if(HAVE_VULKAN)
-  list(APPEND SHADERTOY_SOURCES src/spirv_compile.cpp src/vk_renderer.cpp)
+  list(APPEND SHADERTOY_SOURCES src/spirv_compile.cpp src/vk_renderer.cpp
+       src/vk_offscreen_renderer.cpp)
   list(APPEND SHADERTOY_PUBLIC_HEADERS
        include/shadertoy/spirv_compile.hpp
-       include/shadertoy/vk_renderer.hpp)
+       include/shadertoy/vk_renderer.hpp
+       include/shadertoy/vk_offscreen_renderer.hpp)
 endif()
 if(HAVE_PIPEWIRE)
   # The PipeWire capture back-end; audio.cpp (core) provides the DSP + selector.
