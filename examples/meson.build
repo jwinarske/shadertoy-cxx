@@ -34,4 +34,14 @@ if vulkan_dep.found()
         dependencies: [shadertoy_dep, vulkan_dep],
         install:      false,
     )
+
+    # Queries formats only — no library, no surface, no display. Depends on
+    # Vulkan alone so it stays runnable on a target that has a driver but not
+    # this library's other dependencies.
+    executable(
+        'vk_format_probe',
+        'vk_format_probe.cpp',
+        dependencies: [vulkan_dep],
+        install:      false,
+    )
 endif
