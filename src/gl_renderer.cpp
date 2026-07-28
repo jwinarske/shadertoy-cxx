@@ -400,7 +400,7 @@ void GlRenderer::EnsureBuffers(int w, int h) {
 
 void GlRenderer::RenderPass(const PassGL& p, const ShaderInputs& in) noexcept {
   if (p.target_buffer < 0) {
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, output_fbo_);
     // Shadertoy ignores the Image pass's alpha and always presents an opaque
     // frame.  Clear the destination alpha to 1 and mask alpha writes so the
     // compositor never blends the window with whatever is behind it.

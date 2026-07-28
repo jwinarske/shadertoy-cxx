@@ -52,8 +52,20 @@ class GlRenderer {
   /// fall back to a black stub.
   void SetMediaDir(std::string dir) { media_dir_ = std::move(dir); }
 
+  /// Framebuffer the Image pass draws into.  Defaults to 0, the window-system
+  /// default framebuffer, which is what a swapchain host wants.  A host that
+  /// renders offscreen — into a dma-buf it exports, an FBO it reads back, a
+  /// texture it composites — sets its own FBO here instead, and the Image pass
+  /// targets that directly with no intermediate copy.  Buffer A..D remain
+  /// renderer-owned regardless.
+  ///
+  /// Note that a surfaceless EGL context has no default framebuffer at all, so
+  /// an offscreen host MUST set one: leaving it 0 renders to nothing.
+  void SetOutputFramebuffer(GLuint fbo) noexcept { output_fbo_ = fbo; }
+
   /// Draw one frame.  inputs.res_x/res_y must be the destination framebuffer
-  /// size; the Image pass renders into the currently bound framebuffer (0).
+  /// size; the Image pass renders into the framebuffer named by
+  /// SetOutputFramebuffer (0 by default).
   void Render(const ShaderInputs& inputs) noexcept;
 
   /// Provide a custom audio input for kAudio channels (e.g. a non-microphone
@@ -119,6 +131,7 @@ class GlRenderer {
       tex_dims_;           // GL texture id → iChannelResolution (w,h,depth)
   std::string media_dir_;  // base dir for resolving Shadertoy media src paths
   GLuint vao_ = 0;
+  GLuint output_fbo_ = 0;  // Image pass target; 0 = default framebuffer
   GLuint dummy_tex_ = 0;
   GLuint dummy_cube_ = 0;
   GLuint audio_tex_ = 0;  // 512x2 R8 FFT/waveform texture (0 until audio runs)
