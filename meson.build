@@ -71,7 +71,8 @@ if have_gl
 endif
 
 if have_vulkan
-    sources += ['src/spirv_compile.cpp', 'src/vk_renderer.cpp']
+    sources += ['src/spirv_compile.cpp', 'src/vk_renderer.cpp',
+                'src/vk_offscreen_renderer.cpp']
     deps    += vulkan_dep
     pc_requires += 'vulkan'
 endif
@@ -134,6 +135,7 @@ if have_vulkan
     install_headers(
         'include/shadertoy/spirv_compile.hpp',
         'include/shadertoy/vk_renderer.hpp',
+        'include/shadertoy/vk_offscreen_renderer.hpp',
         subdir: 'shadertoy',
     )
 endif
