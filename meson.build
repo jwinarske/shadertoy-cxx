@@ -70,11 +70,62 @@ if have_gl
     pc_requires += 'glesv2'
 endif
 
+# Linking glslang moves "is there a GLSL compiler?" from the target at runtime
+# to the build. Optional on purpose: the subprocess path stays compiled in every
+# configuration, because a deployment may want a distro-managed compiler it can
+# update without rebuilding, or run on an image that ships the tool but not its
+# development files. Only meaningful on a Vulkan build -- the GL renderer hands
+# GLSL to the driver and needs no SPIR-V.
+cxx          = meson.get_compiler('cpp')
+have_glslang = false
+glslang_dep  = dependency('', required: false)
+if have_vulkan and not get_option('glslang').disabled()
+    # No glslang.pc is shipped by most distributions, so go through its CMake
+    # package config; both components are needed (the resource limits live in a
+    # separate target).
+    glslang_dep = dependency(
+        'glslang',
+        method:   'cmake',
+        modules:  ['glslang::glslang', 'glslang::glslang-default-resource-limits'],
+        required: get_option('glslang'),
+    )
+    # glslang's SPIR-V writer calls into SPIRV-Tools (disassembly and the
+    # optimizer), and its CMake package does not carry those through this
+    # lookup, so the link fails on spvContextCreate and friends unless they are
+    # named here. They are part of the requirement, not an extra: glslang
+    # without them does not link.
+    spirv_tools_deps = []
+    spirv_tools_ok   = glslang_dep.found()
+    foreach lib : ['SPIRV-Tools-opt', 'SPIRV-Tools']
+        found = cxx.find_library(lib, required: false)
+        if found.found()
+            spirv_tools_deps += found
+        else
+            spirv_tools_ok = false
+        endif
+    endforeach
+    if glslang_dep.found() and not spirv_tools_ok
+        msg = 'glslang was found but SPIRV-Tools was not; glslang cannot link without it'
+        if get_option('glslang').enabled()
+            error(msg + '. Install the SPIRV-Tools development package, or pass -Dglslang=disabled.')
+        endif
+        message(msg + ' -- falling back to the glslangValidator/glslc subprocess path')
+    endif
+    have_glslang = glslang_dep.found() and spirv_tools_ok
+    if have_glslang
+        glslang_dep = [glslang_dep] + spirv_tools_deps
+    endif
+endif
+
 if have_vulkan
     sources += ['src/spirv_compile.cpp', 'src/vk_renderer.cpp',
                 'src/vk_offscreen_renderer.cpp']
     deps    += vulkan_dep
     pc_requires += 'vulkan'
+    if have_glslang
+        sources += ['src/spirv_compile_glslang.cpp']
+        deps    += glslang_dep
+    endif
 endif
 
 pc_requires_private = []
@@ -98,6 +149,10 @@ endif
 shadertoy_lib = library(
     'shadertoy',
     sources,
+    # Private, not in config.hpp: this only picks which translation unit defines
+    # the compiler-backend stubs. Consumers neither link glslang nor need to
+    # agree on it.
+    cpp_args:                ['-DSHADERTOY_HAVE_GLSLANG_LIB=' + (have_glslang ? '1' : '0')],
     version:                 meson.project_version(),
     soversion:               ver[0],
     include_directories:     [public_inc, private_inc],
