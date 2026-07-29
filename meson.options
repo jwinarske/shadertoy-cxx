@@ -3,4 +3,5 @@ option('gl',       type: 'feature', value: 'auto', description: 'OpenGL ES 3.0 r
 option('vulkan',   type: 'feature', value: 'auto', description: 'Vulkan render back-end (libvulkan)')
 option('pipewire', type: 'feature', value: 'auto', description: 'PipeWire mic-capture audio back-end (libpipewire-0.3)')
 option('alsa',     type: 'feature', value: 'auto', description: 'ALSA mic-capture audio back-end (libasound)')
+option('glslang',  type: 'feature', value: 'auto', description: 'Link glslang for GLSL->SPIR-V instead of running glslangValidator/glslc (Vulkan back-end only)')
 option('examples', type: 'boolean', value: false,  description: 'Build the standalone offscreen example')
