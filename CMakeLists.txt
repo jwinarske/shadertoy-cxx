@@ -80,10 +80,37 @@ endif()
 set(HAVE_GLSLANG_LIB 0)
 if(HAVE_VULKAN AND NOT SHADERTOY_GLSLANG_LINK STREQUAL "OFF")
   find_package(glslang CONFIG QUIET)
+  # glslang's SPIR-V writer calls into SPIRV-Tools for disassembly and the
+  # optimizer, and its package config does not always carry that through -- a
+  # link then fails on spvContextCreate or spvValidatorOptions*. Whether it
+  # resolves depends on the consumer's link line, so it happened to work for a
+  # downstream shared library here while this project's own examples failed to
+  # link. Name it, rather than depend on which link line is being built.
+  find_library(SHADERTOY_SPIRV_TOOLS_OPT NAMES SPIRV-Tools-opt)
+  find_library(SHADERTOY_SPIRV_TOOLS NAMES SPIRV-Tools)
+  set(_glslang_ok FALSE)
   if(glslang_FOUND AND TARGET glslang::glslang AND
-     TARGET glslang::glslang-default-resource-limits)
+     TARGET glslang::glslang-default-resource-limits AND
+     SHADERTOY_SPIRV_TOOLS_OPT AND SHADERTOY_SPIRV_TOOLS)
+    set(_glslang_ok TRUE)
+  endif()
+  if(_glslang_ok)
     set(HAVE_GLSLANG_LIB 1)
     message(STATUS "shadertoy-cxx: linking glslang for GLSL->SPIR-V")
+  elseif(glslang_FOUND AND NOT (SHADERTOY_SPIRV_TOOLS_OPT AND
+                                SHADERTOY_SPIRV_TOOLS))
+    # Finding one without the other is not a partial success: glslang does not
+    # link without SPIRV-Tools.
+    if(SHADERTOY_GLSLANG_LINK STREQUAL "ON")
+      message(FATAL_ERROR
+              "SHADERTOY_GLSLANG_LINK=ON but SPIRV-Tools was not found, and "
+              "glslang cannot link without it. Install the SPIRV-Tools "
+              "development package, or pass OFF to use the "
+              "glslangValidator/glslc subprocess path instead.")
+    endif()
+    message(STATUS
+            "shadertoy-cxx: glslang found but SPIRV-Tools was not; falling "
+            "back to the glslangValidator/glslc subprocess path")
   elseif(SHADERTOY_GLSLANG_LINK STREQUAL "ON")
     message(FATAL_ERROR
             "SHADERTOY_GLSLANG_LINK=ON but glslang (with "
@@ -216,7 +243,9 @@ endif()
 if(HAVE_GLSLANG_LIB)
   target_link_libraries(shadertoy PRIVATE
                         glslang::glslang
-                        glslang::glslang-default-resource-limits)
+                        glslang::glslang-default-resource-limits
+                        ${SHADERTOY_SPIRV_TOOLS_OPT}
+                        ${SHADERTOY_SPIRV_TOOLS})
   target_compile_definitions(shadertoy PRIVATE SHADERTOY_HAVE_GLSLANG_LIB=1)
 else()
   target_compile_definitions(shadertoy PRIVATE SHADERTOY_HAVE_GLSLANG_LIB=0)
