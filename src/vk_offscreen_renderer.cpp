@@ -37,6 +37,34 @@ void main() {
 
 constexpr uint32_t kChannelCount = 4;
 
+// Candidate storage formats for Buffer A..D, best first.
+//
+// Half-float leads because Shadertoy buffers are as often accumulators and
+// state as they are color, carrying values well outside [0,1]; a UNORM target
+// clamps and bands exactly the feedback effects that need the range. The UNORM
+// entries are fallbacks, and taking one silently changes what a shader
+// computes, so the selection says so out loud.
+//
+// Chosen by asking the driver rather than by reputation. On a Pi 5 (V3D, V3DV
+// Mesa) R16G16B16A16_UNORM is not a color attachment at all and
+// R32G32B32A32_SFLOAT cannot be linearly filtered -- one fails at image
+// creation, the other silently samples wrong -- so neither is listed.
+// B10G11R11 is excluded for having no alpha to write.
+// examples/vk_format_probe prints the same table for any target.
+constexpr std::array<VkFormat, 3> kBufferFormatCandidates{
+    VK_FORMAT_R16G16B16A16_SFLOAT,
+    VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+    VK_FORMAT_R8G8B8A8_UNORM,
+};
+
+// A buffer is rendered into and then sampled, with the bilinear fetch a
+// Shadertoy shader expects. Blend is deliberately not required: the full-screen
+// pass overwrites its target.
+constexpr VkFormatFeatureFlags kBufferFormatFeatures =
+    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+    VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+
 }  // namespace
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -51,6 +79,8 @@ constexpr uint32_t kChannelCount = 4;
 struct VkOffscreenApi {
   PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
   PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties =
+      nullptr;
+  PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties =
       nullptr;
 
   PFN_vkCreateShaderModule CreateShaderModule = nullptr;
@@ -139,6 +169,8 @@ bool VkOffscreenApi::Load(PFN_vkGetInstanceProcAddr gipa,
   ST_VKO_INSTANCE_FN(GetDeviceProcAddr, "vkGetDeviceProcAddr");
   ST_VKO_INSTANCE_FN(GetPhysicalDeviceMemoryProperties,
                      "vkGetPhysicalDeviceMemoryProperties");
+  ST_VKO_INSTANCE_FN(GetPhysicalDeviceFormatProperties,
+                     "vkGetPhysicalDeviceFormatProperties");
 #undef ST_VKO_INSTANCE_FN
 
   if (GetDeviceProcAddr == nullptr) {
@@ -211,25 +243,78 @@ bool VkOffscreenApi::Load(PFN_vkGetInstanceProcAddr gipa,
 // VkOffscreenRenderer::Impl
 // ══════════════════════════════════════════════════════════════════════════════
 
+// A Buffer A..D render target: two images, ping-ponged.
+//
+// A Shadertoy buffer may sample its own previous frame, so a single image
+// cannot serve as both this frame's attachment and this frame's input. Every
+// pass reads the front (last frame's result) and writes the back; the pair
+// swaps once at end of frame. This is the same arrangement GlRenderer uses.
+struct BufferVk {
+  std::array<VkImage, 2> image{};
+  std::array<VkDeviceMemory, 2> memory{};
+  std::array<VkImageView, 2> view{};
+  std::array<VkFramebuffer, 2> fb{};
+  uint32_t width = 0;
+  uint32_t height = 0;
+  bool used = false;
+};
+
+// One pass of the program: its own pipeline (each pass is a different shader)
+// and one descriptor set per ping-pong parity.
+//
+// Two sets rather than one rewritten per frame: a set records into the
+// caller's command buffer, so rewriting it would race a frame still in flight.
+// Parity is global -- every buffer swaps together -- so two sets cover it, on
+// the same "no more than one frame in flight against these buffers" assumption
+// the ping-pong itself rests on.
+struct PassVk {
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkShaderModule frag = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, 2> set{};
+  std::array<Channel, kChannelCount> channels{};
+  int target_buffer = -1;  // -1: the Image pass, drawn into the caller's target
+};
+
 struct VkOffscreenRenderer::Impl {
   VkExternalDevice dev{};
   VkOffscreenConfig cfg{};
   VkOffscreenApi api{};
 
   VkRenderPass render_pass = VK_NULL_HANDLE;
+  // Buffer passes end in SHADER_READ_ONLY_OPTIMAL for the next pass to sample,
+  // where the target's pass ends in the caller's requested final_layout, so the
+  // two cannot share a VkRenderPass.
+  VkRenderPass buffer_render_pass = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-  VkPipeline pipeline = VK_NULL_HANDLE;
   VkShaderModule vert_module = VK_NULL_HANDLE;
-  VkShaderModule frag_module = VK_NULL_HANDLE;
 
-  // 1x1 black stub bound to every iChannel, matching the swapchain renderer.
+  // Buffer passes in ascending order, Image pass last. Empty until SetProgram.
+  std::vector<PassVk> passes;
+  std::array<BufferVk, kNumBuffers> buffers{};
+  // Which half of every ping-pong pair currently holds the previous frame.
+  uint32_t front = 0;
+  // Resolved once against the physical device; VK_FORMAT_UNDEFINED until then.
+  VkFormat buffer_format = VK_FORMAT_UNDEFINED;
+  // Descriptor sets are allocated by BuildProgram but can only be filled in
+  // once the buffers they name exist, which needs a target size. Cleared
+  // whenever the sets or the views they point at are replaced.
+  bool sets_written = false;
+  // Freshly created buffer images are UNDEFINED, but the first frame samples
+  // the front half before any pass has written it. Recorded into the caller's
+  // command buffer on the next frame, so no extra queue submission is needed.
+  bool buffers_need_layout_init = false;
+  // Kept so a target resize can rebuild the buffers and rewrite the sets
+  // without the host having to call SetProgram again.
+  ShaderProgram program{};
+
+  // 1x1 black stub, bound to every channel this renderer cannot supply
+  // (textures, cubemaps, audio, keyboard -- unimplemented here, as before).
   VkImage stub_image = VK_NULL_HANDLE;
   VkDeviceMemory stub_memory = VK_NULL_HANDLE;
   VkImageView stub_view = VK_NULL_HANDLE;
   VkSampler sampler = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-  VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 
   VkCommandPool setup_pool = VK_NULL_HANDLE;
 
@@ -240,10 +325,19 @@ struct VkOffscreenRenderer::Impl {
 
   ~Impl() { Cleanup(); }
 
+  [[nodiscard]] bool SelectBufferFormat();
   [[nodiscard]] bool CreateRenderPass();
   [[nodiscard]] bool CreateStubTexture();
   [[nodiscard]] bool CreateDescriptors();
-  [[nodiscard]] bool BuildPipeline(const std::string& frag_glsl);
+  [[nodiscard]] bool BuildProgram(const ShaderProgram& src);
+  [[nodiscard]] bool EnsureBuffers(uint32_t width, uint32_t height);
+  void WriteDescriptorSets();
+  void DestroyBuffers();
+  void DestroyPasses();
+  [[nodiscard]] bool MakePipeline(const std::string& frag_glsl,
+                                  VkRenderPass pass,
+                                  VkPipeline* out_pipeline,
+                                  VkShaderModule* out_frag);
   [[nodiscard]] VkFramebuffer FramebufferFor(const VkOffscreenTarget& target);
   void Cleanup();
 
@@ -256,9 +350,19 @@ struct VkOffscreenRenderer::Impl {
 // ── Render pass
 // ───────────────────────────────────────────────────────────────
 
-bool VkOffscreenRenderer::Impl::CreateRenderPass() {
+namespace {
+
+// Build the one-subpass color render pass both the target and the buffer
+// attachments use. They differ only in format and in the layouts they start and
+// end in, so the dependency reasoning below is written once.
+[[nodiscard]] bool MakeColorRenderPass(const VkOffscreenApi& api,
+                                       VkDevice device,
+                                       VkFormat format,
+                                       VkImageLayout initial_layout,
+                                       VkImageLayout final_layout,
+                                       VkRenderPass* out) {
   VkAttachmentDescription color{};
-  color.format = cfg.color_format;
+  color.format = format;
   color.samples = VK_SAMPLE_COUNT_1_BIT;
   // The Image pass covers every pixel, so the previous contents are never read.
   // CLEAR rather than DONT_CARE all the same: a shader that writes alpha < 1,
@@ -268,8 +372,8 @@ bool VkOffscreenRenderer::Impl::CreateRenderPass() {
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  color.initialLayout = cfg.initial_layout;
-  color.finalLayout = cfg.final_layout;
+  color.initialLayout = initial_layout;
+  color.finalLayout = final_layout;
 
   VkAttachmentReference color_ref{};
   color_ref.attachment = 0;
@@ -313,9 +417,55 @@ bool VkOffscreenRenderer::Impl::CreateRenderPass() {
   info.dependencyCount = static_cast<uint32_t>(deps.size());
   info.pDependencies = deps.data();
 
-  ST_VKO_CHECK(api.CreateRenderPass(dev.device, &info, nullptr, &render_pass),
+  ST_VKO_CHECK(api.CreateRenderPass(device, &info, nullptr, out),
                "vkCreateRenderPass failed");
   return true;
+}
+
+}  // namespace
+
+bool VkOffscreenRenderer::Impl::SelectBufferFormat() {
+  for (const VkFormat candidate : kBufferFormatCandidates) {
+    VkFormatProperties props{};
+    api.GetPhysicalDeviceFormatProperties(dev.physical_device, candidate,
+                                          &props);
+    if ((props.optimalTilingFeatures & kBufferFormatFeatures) !=
+        kBufferFormatFeatures) {
+      continue;
+    }
+    buffer_format = candidate;
+    // Say so when the choice is not the half-float one. A UNORM buffer clamps
+    // to [0,1], which does not fail -- it quietly changes what an accumulating
+    // shader computes, and that reads as a bug in the shader.
+    if (candidate != kBufferFormatCandidates.front()) {
+      std::fprintf(stderr,
+                   "shadertoy: multi-pass buffers fall back to a clamped "
+                   "format (VkFormat %d); shaders that accumulate outside "
+                   "[0,1] will differ from Shadertoy\n",
+                   static_cast<int>(candidate));
+    }
+    return true;
+  }
+  std::fprintf(stderr,
+               "shadertoy: no buffer format on this device is renderable, "
+               "samplable and linearly filterable; multi-pass is unavailable "
+               "(see examples/vk_format_probe)\n");
+  return false;
+}
+
+bool VkOffscreenRenderer::Impl::CreateRenderPass() {
+  if (!MakeColorRenderPass(api, dev.device, cfg.color_format,
+                           cfg.initial_layout, cfg.final_layout,
+                           &render_pass)) {
+    return false;
+  }
+  // Buffer attachments are this renderer's own, so it dictates both ends:
+  // UNDEFINED in (the previous contents are the frame before last, which the
+  // pass overwrites) and SHADER_READ_ONLY out, ready for the next pass to
+  // sample without a separate barrier.
+  return MakeColorRenderPass(
+      api, dev.device, buffer_format, VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, &buffer_render_pass);
 }
 
 // ── Stub channel texture
@@ -476,41 +626,8 @@ bool VkOffscreenRenderer::Impl::CreateDescriptors() {
       api.CreateDescriptorSetLayout(dev.device, &layout, nullptr, &set_layout),
       "vkCreateDescriptorSetLayout failed");
 
-  VkDescriptorPoolSize size{};
-  size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  size.descriptorCount = kChannelCount;
-  VkDescriptorPoolCreateInfo pool{};
-  pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pool.maxSets = 1;
-  pool.poolSizeCount = 1;
-  pool.pPoolSizes = &size;
-  ST_VKO_CHECK(
-      api.CreateDescriptorPool(dev.device, &pool, nullptr, &descriptor_pool),
-      "vkCreateDescriptorPool failed");
-
-  VkDescriptorSetAllocateInfo alloc{};
-  alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  alloc.descriptorPool = descriptor_pool;
-  alloc.descriptorSetCount = 1;
-  alloc.pSetLayouts = &set_layout;
-  ST_VKO_CHECK(api.AllocateDescriptorSets(dev.device, &alloc, &descriptor_set),
-               "vkAllocateDescriptorSets failed");
-
-  VkDescriptorImageInfo image_info{};
-  image_info.sampler = sampler;
-  image_info.imageView = stub_view;
-  image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  std::array<VkWriteDescriptorSet, kChannelCount> writes{};
-  for (uint32_t i = 0; i < kChannelCount; ++i) {
-    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet = descriptor_set;
-    writes[i].dstBinding = i;
-    writes[i].descriptorCount = 1;
-    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[i].pImageInfo = &image_info;
-  }
-  api.UpdateDescriptorSets(dev.device, static_cast<uint32_t>(writes.size()),
-                           writes.data(), 0, nullptr);
+  // The pool is sized to the program, so it is created in BuildProgram rather
+  // than here: a single-pass program needs two sets, a five-pass one ten.
   return true;
 }
 
@@ -534,27 +651,33 @@ VkShaderModule VkOffscreenRenderer::Impl::MakeModule(
   return module;
 }
 
-bool VkOffscreenRenderer::Impl::BuildPipeline(const std::string& frag_glsl) {
-  const std::vector<uint32_t> vert_spirv =
-      CompileToSpirv(kVertexShader, ShaderStage::kVertex);
+bool VkOffscreenRenderer::Impl::MakePipeline(const std::string& frag_glsl,
+                                             VkRenderPass pass,
+                                             VkPipeline* out_pipeline,
+                                             VkShaderModule* out_frag) {
+  // The vertex stage is the same generated full-screen triangle for every pass,
+  // so it is compiled once and shared rather than per pass.
+  if (vert_module == VK_NULL_HANDLE) {
+    const std::vector<uint32_t> vert_spirv =
+        CompileToSpirv(kVertexShader, ShaderStage::kVertex);
+    vert_module = MakeModule(vert_spirv);
+    if (vert_module == VK_NULL_HANDLE) {
+      std::fprintf(stderr, "shadertoy: vertex shader compilation failed\n");
+      return false;
+    }
+  }
   const std::vector<uint32_t> frag_spirv =
       CompileToSpirv(frag_glsl, ShaderStage::kFragment);
-  if (vert_spirv.empty() || frag_spirv.empty()) {
+  if (frag_spirv.empty()) {
     std::fprintf(stderr, "shadertoy: GLSL to SPIR-V compilation failed\n");
     return false;
   }
 
-  // Build into locals and only publish on success, so a failed SetProgram
+  // Built into locals and handed back only on success, so a failed SetProgram
   // leaves the previous program running.
-  VkShaderModule new_vert = MakeModule(vert_spirv);
+  VkShaderModule new_vert = vert_module;
   VkShaderModule new_frag = MakeModule(frag_spirv);
-  if (new_vert == VK_NULL_HANDLE || new_frag == VK_NULL_HANDLE) {
-    if (new_vert != VK_NULL_HANDLE) {
-      api.DestroyShaderModule(dev.device, new_vert, nullptr);
-    }
-    if (new_frag != VK_NULL_HANDLE) {
-      api.DestroyShaderModule(dev.device, new_frag, nullptr);
-    }
+  if (new_frag == VK_NULL_HANDLE) {
     std::fprintf(stderr, "shadertoy: vkCreateShaderModule failed\n");
     return false;
   }
@@ -643,34 +766,303 @@ bool VkOffscreenRenderer::Impl::BuildPipeline(const std::string& frag_glsl) {
   info.pColorBlendState = &blend;
   info.pDynamicState = &dynamic;
   info.layout = pipeline_layout;
-  info.renderPass = render_pass;
+  info.renderPass = pass;
   info.subpass = 0;
 
   VkPipeline new_pipeline = VK_NULL_HANDLE;
   const VkResult result = api.CreateGraphicsPipelines(
       dev.device, VK_NULL_HANDLE, 1, &info, nullptr, &new_pipeline);
   if (result != VK_SUCCESS) {
-    api.DestroyShaderModule(dev.device, new_vert, nullptr);
     api.DestroyShaderModule(dev.device, new_frag, nullptr);
     std::fprintf(stderr, "shadertoy: vkCreateGraphicsPipelines (VkResult %d)\n",
                  static_cast<int>(result));
     return false;
   }
 
-  // Success — retire the old program. The caller must not have work in flight
-  // against it; the host owns submission and so owns that guarantee.
-  if (pipeline != VK_NULL_HANDLE) {
-    api.DestroyPipeline(dev.device, pipeline, nullptr);
+  // Hand both back; the caller owns them and publishes only once every pass of
+  // the program has been built.
+  (void)new_vert;
+  *out_pipeline = new_pipeline;
+  *out_frag = new_frag;
+  return true;
+}
+
+// ── Buffer passes (Buffer A..D)
+// ────────────────────────────────────────────────
+
+void VkOffscreenRenderer::Impl::DestroyBuffers() {
+  for (BufferVk& b : buffers) {
+    for (size_t i = 0; i < 2; ++i) {
+      if (b.fb[i] != VK_NULL_HANDLE) {
+        api.DestroyFramebuffer(dev.device, b.fb[i], nullptr);
+      }
+      if (b.view[i] != VK_NULL_HANDLE) {
+        api.DestroyImageView(dev.device, b.view[i], nullptr);
+      }
+      if (b.image[i] != VK_NULL_HANDLE) {
+        api.DestroyImage(dev.device, b.image[i], nullptr);
+      }
+      if (b.memory[i] != VK_NULL_HANDLE) {
+        api.FreeMemory(dev.device, b.memory[i], nullptr);
+      }
+    }
+    b = BufferVk{};
   }
-  if (vert_module != VK_NULL_HANDLE) {
-    api.DestroyShaderModule(dev.device, vert_module, nullptr);
+}
+
+bool VkOffscreenRenderer::Impl::EnsureBuffers(const uint32_t width,
+                                              const uint32_t height) {
+  // Buffers are the size of the target, so a resize rebuilds them. Nothing here
+  // submits: the images are created UNDEFINED and the first render pass that
+  // writes one performs the transition, which keeps this renderer's "only one
+  // queue submission, ever" property intact.
+  bool need_rebuild = false;
+  for (int i = 0; i < kNumBuffers; ++i) {
+    const BufferVk& b = buffers[static_cast<size_t>(i)];
+    const bool wanted = program.uses_buffer(i);
+    if (wanted != b.used ||
+        (wanted && (b.width != width || b.height != height))) {
+      need_rebuild = true;
+      break;
+    }
   }
-  if (frag_module != VK_NULL_HANDLE) {
-    api.DestroyShaderModule(dev.device, frag_module, nullptr);
+  if (!need_rebuild) {
+    // A new program reuses buffers of the same size and shape, so nothing is
+    // rebuilt -- but its sets are freshly allocated and still empty. Binding
+    // one unwritten is undefined, and it would go unnoticed until some shader
+    // actually sampled a channel.
+    if (!sets_written) {
+      WriteDescriptorSets();
+      sets_written = true;
+    }
+    return true;
   }
-  pipeline = new_pipeline;
-  vert_module = new_vert;
-  frag_module = new_frag;
+  // The host must not have frames in flight across a resize; it owns submission
+  // and so owns that guarantee, exactly as it does for SetProgram.
+  DestroyBuffers();
+
+  for (int i = 0; i < kNumBuffers; ++i) {
+    if (!program.uses_buffer(i)) {
+      continue;
+    }
+    BufferVk& b = buffers[static_cast<size_t>(i)];
+    b.used = true;
+    b.width = width;
+    b.height = height;
+    for (size_t half = 0; half < 2; ++half) {
+      VkImageCreateInfo image{};
+      image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+      image.imageType = VK_IMAGE_TYPE_2D;
+      image.format = buffer_format;
+      image.extent = {width, height, 1};
+      image.mipLevels = 1;
+      image.arrayLayers = 1;
+      image.samples = VK_SAMPLE_COUNT_1_BIT;
+      image.tiling = VK_IMAGE_TILING_OPTIMAL;
+      image.usage =
+          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+      image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      ST_VKO_CHECK(api.CreateImage(dev.device, &image, nullptr, &b.image[half]),
+                   "vkCreateImage(buffer) failed");
+
+      VkMemoryRequirements req{};
+      api.GetImageMemoryRequirements(dev.device, b.image[half], &req);
+      uint32_t type_index = 0;
+      if (!FindMemoryType(req.memoryTypeBits,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_index)) {
+        return false;
+      }
+      VkMemoryAllocateInfo alloc{};
+      alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      alloc.allocationSize = req.size;
+      alloc.memoryTypeIndex = type_index;
+      ST_VKO_CHECK(
+          api.AllocateMemory(dev.device, &alloc, nullptr, &b.memory[half]),
+          "vkAllocateMemory(buffer) failed");
+      ST_VKO_CHECK(
+          api.BindImageMemory(dev.device, b.image[half], b.memory[half], 0),
+          "vkBindImageMemory(buffer) failed");
+
+      VkImageViewCreateInfo view{};
+      view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+      view.image = b.image[half];
+      view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      view.format = buffer_format;
+      view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      ST_VKO_CHECK(
+          api.CreateImageView(dev.device, &view, nullptr, &b.view[half]),
+          "vkCreateImageView(buffer) failed");
+
+      VkFramebufferCreateInfo fb{};
+      fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+      fb.renderPass = buffer_render_pass;
+      fb.attachmentCount = 1;
+      fb.pAttachments = &b.view[half];
+      fb.width = width;
+      fb.height = height;
+      fb.layers = 1;
+      ST_VKO_CHECK(api.CreateFramebuffer(dev.device, &fb, nullptr, &b.fb[half]),
+                   "vkCreateFramebuffer(buffer) failed");
+    }
+  }
+  // The sets name buffer views, which have just been replaced.
+  WriteDescriptorSets();
+  sets_written = true;
+  buffers_need_layout_init = true;
+  return true;
+}
+
+void VkOffscreenRenderer::Impl::WriteDescriptorSets() {
+  // One set per pass per ping-pong parity. Parity p means "front == p", so a
+  // kBuffer channel in that set points at the half holding the previous frame.
+  // Everything this renderer cannot supply -- textures, cubemaps, audio,
+  // keyboard -- resolves to the 1x1 black stub, as it did before multi-pass.
+  for (const PassVk& pass : passes) {
+    for (uint32_t parity = 0; parity < 2; ++parity) {
+      if (pass.set[parity] == VK_NULL_HANDLE) {
+        continue;
+      }
+      std::array<VkDescriptorImageInfo, kChannelCount> infos{};
+      std::array<VkWriteDescriptorSet, kChannelCount> writes{};
+      for (uint32_t i = 0; i < kChannelCount; ++i) {
+        const Channel& ch = pass.channels[i];
+        VkImageView view = stub_view;
+        if (ch.kind == ChannelKind::kBuffer && ch.buffer >= 0 &&
+            ch.buffer < kNumBuffers) {
+          const BufferVk& src = buffers[static_cast<size_t>(ch.buffer)];
+          if (src.used && src.view[parity] != VK_NULL_HANDLE) {
+            view = src.view[parity];
+          }
+        }
+        infos[i].sampler = sampler;
+        infos[i].imageView = view;
+        infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = pass.set[parity];
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &infos[i];
+      }
+      api.UpdateDescriptorSets(dev.device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
+  }
+}
+
+void VkOffscreenRenderer::Impl::DestroyPasses() {
+  for (PassVk& pass : passes) {
+    if (pass.pipeline != VK_NULL_HANDLE) {
+      api.DestroyPipeline(dev.device, pass.pipeline, nullptr);
+    }
+    if (pass.frag != VK_NULL_HANDLE) {
+      api.DestroyShaderModule(dev.device, pass.frag, nullptr);
+    }
+  }
+  passes.clear();
+  // Frees every set allocated from it; the sets are not freed individually.
+  if (descriptor_pool != VK_NULL_HANDLE) {
+    api.DestroyDescriptorPool(dev.device, descriptor_pool, nullptr);
+    descriptor_pool = VK_NULL_HANDLE;
+  }
+}
+
+bool VkOffscreenRenderer::Impl::BuildProgram(const ShaderProgram& src) {
+  // Buffer passes first, in Shadertoy order, then Image. A buffer reads the
+  // previous frame of every buffer, so within a frame the order only decides
+  // which passes see this frame's writes -- and none do, by construction.
+  std::vector<PassVk> built;
+  std::vector<const Pass*> sources;
+  for (int i = 0; i < kNumBuffers; ++i) {
+    if (src.uses_buffer(i)) {
+      PassVk p{};
+      p.target_buffer = i;
+      p.channels = src.buffers[static_cast<size_t>(i)].channels;
+      built.push_back(p);
+      sources.push_back(&src.buffers[static_cast<size_t>(i)]);
+    }
+  }
+  {
+    PassVk p{};
+    p.target_buffer = -1;
+    p.channels = src.image.channels;
+    built.push_back(p);
+    sources.push_back(&src.image);
+  }
+
+  // Compile and build every pipeline before touching live state, so a program
+  // that fails to compile leaves the previous one running.
+  bool ok = true;
+  for (size_t i = 0; i < built.size() && ok; ++i) {
+    const std::string frag = WrapVulkan(src.common, sources[i]->code);
+    VkRenderPass pass =
+        built[i].target_buffer < 0 ? render_pass : buffer_render_pass;
+    ok = MakePipeline(frag, pass, &built[i].pipeline, &built[i].frag);
+  }
+
+  VkDescriptorPool new_pool = VK_NULL_HANDLE;
+  if (ok) {
+    const auto sets = static_cast<uint32_t>(built.size() * 2);
+    VkDescriptorPoolSize size{};
+    size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    size.descriptorCount = kChannelCount * sets;
+    VkDescriptorPoolCreateInfo pool{};
+    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool.maxSets = sets;
+    pool.poolSizeCount = 1;
+    pool.pPoolSizes = &size;
+    if (api.CreateDescriptorPool(dev.device, &pool, nullptr, &new_pool) !=
+        VK_SUCCESS) {
+      std::fprintf(stderr, "shadertoy: vkCreateDescriptorPool failed\n");
+      ok = false;
+    }
+  }
+  if (ok) {
+    for (PassVk& p : built) {
+      const std::array<VkDescriptorSetLayout, 2> layouts{set_layout,
+                                                         set_layout};
+      VkDescriptorSetAllocateInfo alloc{};
+      alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      alloc.descriptorPool = new_pool;
+      alloc.descriptorSetCount = 2;
+      alloc.pSetLayouts = layouts.data();
+      if (api.AllocateDescriptorSets(dev.device, &alloc, p.set.data()) !=
+          VK_SUCCESS) {
+        std::fprintf(stderr, "shadertoy: vkAllocateDescriptorSets failed\n");
+        ok = false;
+        break;
+      }
+    }
+  }
+
+  if (!ok) {
+    for (PassVk& p : built) {
+      if (p.pipeline != VK_NULL_HANDLE) {
+        api.DestroyPipeline(dev.device, p.pipeline, nullptr);
+      }
+      if (p.frag != VK_NULL_HANDLE) {
+        api.DestroyShaderModule(dev.device, p.frag, nullptr);
+      }
+    }
+    if (new_pool != VK_NULL_HANDLE) {
+      api.DestroyDescriptorPool(dev.device, new_pool, nullptr);
+    }
+    return false;
+  }
+
+  // Publish. The caller must not have work in flight against the old program;
+  // the host owns submission and so owns that guarantee.
+  DestroyPasses();
+  DestroyBuffers();  // sized to the old program's buffer set
+  passes = std::move(built);
+  descriptor_pool = new_pool;
+  program = src;
+  front = 0;
+  sets_written = false;
+  // Sets are written once the buffers exist, which RecordRender arranges as
+  // soon as it knows the target size. Until then they hold undefined contents
+  // and are never bound, because no frame has been recorded.
   return true;
 }
 
@@ -717,9 +1109,14 @@ void VkOffscreenRenderer::Impl::Cleanup() {
   }
   framebuffers.clear();
 
-  if (pipeline != VK_NULL_HANDLE) {
-    api.DestroyPipeline(dev.device, pipeline, nullptr);
-    pipeline = VK_NULL_HANDLE;
+  // Passes own the per-pass pipelines and fragment modules and free the
+  // descriptor pool; buffers own their images, memory, views and framebuffers.
+  DestroyPasses();
+  DestroyBuffers();
+
+  if (buffer_render_pass != VK_NULL_HANDLE) {
+    api.DestroyRenderPass(dev.device, buffer_render_pass, nullptr);
+    buffer_render_pass = VK_NULL_HANDLE;
   }
   if (pipeline_layout != VK_NULL_HANDLE) {
     api.DestroyPipelineLayout(dev.device, pipeline_layout, nullptr);
@@ -728,10 +1125,6 @@ void VkOffscreenRenderer::Impl::Cleanup() {
   if (vert_module != VK_NULL_HANDLE) {
     api.DestroyShaderModule(dev.device, vert_module, nullptr);
     vert_module = VK_NULL_HANDLE;
-  }
-  if (frag_module != VK_NULL_HANDLE) {
-    api.DestroyShaderModule(dev.device, frag_module, nullptr);
-    frag_module = VK_NULL_HANDLE;
   }
   if (descriptor_pool != VK_NULL_HANDLE) {
     api.DestroyDescriptorPool(dev.device, descriptor_pool, nullptr);
@@ -797,27 +1190,21 @@ std::unique_ptr<VkOffscreenRenderer> VkOffscreenRenderer::Create(
                      device.device)) {
     return nullptr;
   }
-  if (!impl.CreateRenderPass() || !impl.CreateStubTexture() ||
-      !impl.CreateDescriptors()) {
+  // SelectBufferFormat first: CreateRenderPass builds the buffer render pass
+  // against the format it picks.
+  if (!impl.SelectBufferFormat() || !impl.CreateRenderPass() ||
+      !impl.CreateStubTexture() || !impl.CreateDescriptors()) {
     return nullptr;
   }
   return self;
 }
 
 bool VkOffscreenRenderer::SetProgram(const ShaderProgram& program) {
-  if (program.multipass()) {
-    std::fprintf(stderr,
-                 "shadertoy: VkOffscreenRenderer does not implement Buffer "
-                 "A..D yet; refusing '%s' rather than rendering only its Image "
-                 "pass\n",
-                 program.name.c_str());
-    return false;
-  }
-  // Channels are not bound yet either — every iChannel samples the 1x1 black
-  // stub, so declare them all as sampler2D. Same behavior as the swapchain
-  // renderer; a shader that samples a cubemap channel will not compile.
-  const std::string frag = WrapVulkan(program.common, program.image.code);
-  return impl_->BuildPipeline(frag);
+  // Channels this renderer cannot supply still resolve to the 1x1 black stub,
+  // so every iChannel is declared sampler2D and a shader sampling a cubemap
+  // channel will not compile -- unchanged from before multi-pass. What is new
+  // is that a kBuffer channel now names a real image.
+  return impl_->BuildProgram(program);
 }
 
 bool VkOffscreenRenderer::Init(const std::string& image_shader) {
@@ -825,14 +1212,14 @@ bool VkOffscreenRenderer::Init(const std::string& image_shader) {
 }
 
 bool VkOffscreenRenderer::has_program() const noexcept {
-  return impl_->pipeline != VK_NULL_HANDLE;
+  return !impl_->passes.empty();
 }
 
 bool VkOffscreenRenderer::RecordRender(VkCommandBuffer cmd,
                                        const ShaderInputs& inputs,
                                        const VkOffscreenTarget& target) {
   Impl& impl = *impl_;
-  if (impl.pipeline == VK_NULL_HANDLE) {
+  if (impl.passes.empty()) {
     std::fprintf(stderr, "shadertoy: RecordRender with no program set\n");
     return false;
   }
@@ -843,50 +1230,114 @@ bool VkOffscreenRenderer::RecordRender(VkCommandBuffer cmd,
                  "shadertoy: RecordRender given an incomplete target\n");
     return false;
   }
-  const VkFramebuffer fb = impl.FramebufferFor(target);
-  if (fb == VK_NULL_HANDLE) {
+  // Buffers are target-sized; this rebuilds them on the first frame and after a
+  // resize, and rewrites the descriptor sets that name their views.
+  if (!impl.EnsureBuffers(target.width, target.height)) {
+    return false;
+  }
+  const VkFramebuffer target_fb = impl.FramebufferFor(target);
+  if (target_fb == VK_NULL_HANDLE) {
     return false;
   }
 
-  VkClearValue clear{};
-  clear.color = {{0.0F, 0.0F, 0.0F, 1.0F}};
-
-  VkRenderPassBeginInfo begin{};
-  begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-  begin.renderPass = impl.render_pass;
-  begin.framebuffer = fb;
-  begin.renderArea.offset = {0, 0};
-  begin.renderArea.extent = {target.width, target.height};
-  begin.clearValueCount = 1;
-  begin.pClearValues = &clear;
-  impl.api.CmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
-
-  VkViewport viewport{};
-  viewport.x = 0.0F;
-  viewport.y = 0.0F;
-  viewport.width = static_cast<float>(target.width);
-  viewport.height = static_cast<float>(target.height);
-  viewport.minDepth = 0.0F;
-  viewport.maxDepth = 1.0F;
-  impl.api.CmdSetViewport(cmd, 0, 1, &viewport);
-
-  VkRect2D scissor{};
-  scissor.offset = {0, 0};
-  scissor.extent = {target.width, target.height};
-  impl.api.CmdSetScissor(cmd, 0, 1, &scissor);
-
-  impl.api.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, impl.pipeline);
-  impl.api.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                 impl.pipeline_layout, 0, 1,
-                                 &impl.descriptor_set, 0, nullptr);
+  // Move both halves of every buffer into the layout their descriptors claim.
+  // Without this the first frame samples an image still in UNDEFINED, which is
+  // undefined use even though it happens to read as black on the drivers here.
+  if (impl.buffers_need_layout_init) {
+    std::vector<VkImageMemoryBarrier> barriers;
+    for (const BufferVk& b : impl.buffers) {
+      if (!b.used) {
+        continue;
+      }
+      for (size_t half = 0; half < 2; ++half) {
+        VkImageMemoryBarrier bar{};
+        bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.image = b.image[half];
+        bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        bar.srcAccessMask = 0;
+        bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barriers.push_back(bar);
+      }
+    }
+    if (!barriers.empty()) {
+      impl.api.CmdPipelineBarrier(
+          cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+          static_cast<uint32_t>(barriers.size()), barriers.data());
+    }
+    impl.buffers_need_layout_init = false;
+  }
 
   const PushConstants push = ToPushConstants(inputs);
-  impl.api.CmdPushConstants(cmd, impl.pipeline_layout,
-                            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
-                            &push);
+  const uint32_t parity = impl.front;
 
-  impl.api.CmdDraw(cmd, 3, 1, 0, 0);
-  impl.api.CmdEndRenderPass(cmd);
+  // Every pass reads the front half (last frame's output) and writes the back.
+  // Nothing within this frame reads what this frame wrote, which is what makes
+  // the pass order irrelevant to correctness and matches Shadertoy.
+  for (const PassVk& pass : impl.passes) {
+    VkFramebuffer fb = target_fb;
+    uint32_t width = target.width;
+    uint32_t height = target.height;
+    if (pass.target_buffer >= 0) {
+      const BufferVk& dst =
+          impl.buffers[static_cast<size_t>(pass.target_buffer)];
+      if (!dst.used) {
+        continue;
+      }
+      fb = dst.fb[1U - parity];  // the back half
+      width = dst.width;
+      height = dst.height;
+    }
+
+    VkClearValue clear{};
+    clear.color = {{0.0F, 0.0F, 0.0F, 1.0F}};
+    VkRenderPassBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    begin.renderPass =
+        pass.target_buffer < 0 ? impl.render_pass : impl.buffer_render_pass;
+    begin.framebuffer = fb;
+    begin.renderArea.offset = {0, 0};
+    begin.renderArea.extent = {width, height};
+    begin.clearValueCount = 1;
+    begin.pClearValues = &clear;
+    impl.api.CmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.x = 0.0F;
+    viewport.y = 0.0F;
+    viewport.width = static_cast<float>(width);
+    viewport.height = static_cast<float>(height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    impl.api.CmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {width, height};
+    impl.api.CmdSetScissor(cmd, 0, 1, &scissor);
+
+    impl.api.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                             pass.pipeline);
+    impl.api.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                   impl.pipeline_layout, 0, 1,
+                                   &pass.set[parity], 0, nullptr);
+    impl.api.CmdPushConstants(cmd, impl.pipeline_layout,
+                              VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+                              &push);
+    impl.api.CmdDraw(cmd, 3, 1, 0, 0);
+    impl.api.CmdEndRenderPass(cmd);
+    // The buffer render pass ends in SHADER_READ_ONLY_OPTIMAL and its
+    // subpass-to-external dependency covers the fragment read, so a later pass
+    // sampling this buffer needs no barrier here. It will not sample this
+    // frame's write in any case -- it reads the other half.
+  }
+
+  // One flip for all buffers: what this frame wrote becomes next frame's front.
+  impl.front = 1U - impl.front;
   return true;
 }
 

@@ -108,8 +108,16 @@ class VkOffscreenRenderer {
   /// previous program intact — matching GlRenderer::SetProgram, so a host can
   /// hot-swap shaders without risking a blank view.
   ///
-  /// Multi-pass programs (Buffer A..D) are not implemented yet and are
-  /// rejected rather than silently rendering only the Image pass.
+  /// Multi-pass programs (Buffer A..D) are supported: each buffer pass renders
+  /// into its own ping-ponged offscreen pair, and a kBuffer channel samples the
+  /// previous frame's half, as Shadertoy does. Buffer storage is chosen by
+  /// asking the device (see examples/vk_format_probe); half-float is preferred
+  /// and a fallback to a clamped format is reported, because it changes what an
+  /// accumulating shader computes.
+  ///
+  /// Channels this renderer cannot supply -- textures, cubemaps, audio,
+  /// keyboard -- still sample the 1x1 black stub, so every iChannel is declared
+  /// sampler2D and a shader sampling a cubemap channel will not compile.
   [[nodiscard]] bool SetProgram(const ShaderProgram& program);
 
   /// Single-pass convenience, mirroring GlRenderer::Init.
