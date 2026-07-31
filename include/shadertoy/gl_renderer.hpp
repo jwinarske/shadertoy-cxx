@@ -52,6 +52,14 @@ class GlRenderer {
   /// fall back to a black stub.
   void SetMediaDir(std::string dir) { media_dir_ = std::move(dir); }
 
+  /// The GLSL compile/link log from the most recent SetProgram, or empty when
+  /// it succeeded. Cleared at the start of every SetProgram, so it always
+  /// describes the latest attempt. A failed SetProgram leaves the previous
+  /// program running, so a host can show this without the view going blank.
+  [[nodiscard]] const std::string& last_compile_log() const {
+    return compile_log_;
+  }
+
   /// Framebuffer the Image pass draws into.  Defaults to 0, the window-system
   /// default framebuffer, which is what a swapchain host wants.  A host that
   /// renders offscreen — into a dma-buf it exports, an FBO it reads back, a
@@ -120,7 +128,9 @@ class GlRenderer {
   void RenderPass(const PassGL& p, const ShaderInputs& in) noexcept;
   void DestroyPass(PassGL& p) noexcept;
   [[nodiscard]] bool uses_buffer_internal(int b) const noexcept;
-  static GLuint Compile(GLenum type, const char* src);
+  /// @p log, when non-null, receives the compile diagnostics on failure.
+  /// Static, so the buffer is passed rather than reached through the instance.
+  static GLuint Compile(GLenum type, const char* src, std::string* log);
 
   std::vector<PassGL> buffer_passes_;  // only the used buffers, in A..D order
   PassGL image_pass_;
@@ -130,6 +140,8 @@ class GlRenderer {
   std::unordered_map<GLuint, std::array<float, 3>>
       tex_dims_;           // GL texture id → iChannelResolution (w,h,depth)
   std::string media_dir_;  // base dir for resolving Shadertoy media src paths
+  // Diagnostics from the most recent SetProgram; empty on success.
+  std::string compile_log_;
   GLuint vao_ = 0;
   GLuint output_fbo_ = 0;  // Image pass target; 0 = default framebuffer
   GLuint dummy_tex_ = 0;
