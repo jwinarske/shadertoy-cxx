@@ -32,6 +32,7 @@
 #include <memory>
 #include <string>
 
+#include "shadertoy/audio.hpp"
 #include "shadertoy/inputs.hpp"
 #include "shadertoy/program.hpp"
 
@@ -127,6 +128,17 @@ class VkOffscreenRenderer {
   /// A failed SetProgram leaves the previous program running, so a host can
   /// show this without the view going blank.
   [[nodiscard]] const std::string& last_compile_log() const;
+
+  /// Provide a custom audio input for kAudio channels, or null to disable
+  /// audio entirely (kAudio channels then sample a silent black texture).
+  /// Mirrors GlRenderer::SetAudioSource: the renderer does not own the
+  /// lifecycle of an injected source -- call AudioSource::Start() before
+  /// rendering and Stop() after.
+  void SetAudioSource(std::shared_ptr<AudioSource> src) noexcept;
+
+  /// Enable or disable the default microphone capture used for kAudio
+  /// channels. No effect once SetAudioSource has been called.
+  void SetAudioEnabled(bool enabled) noexcept;
 
   /// Base directory for resolving a texture channel's Shadertoy media src
   /// ("/media/a/<hash>.png") onto a local file, mirroring
