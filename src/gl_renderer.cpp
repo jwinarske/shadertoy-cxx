@@ -235,19 +235,9 @@ void GlRenderer::UpdateAudio(const ShaderInputs& in) noexcept {
 }
 
 std::string GlRenderer::ResolveMediaPath(const std::string& src) const {
-  // Map a Shadertoy media src ("/media/a/<hash>.png") to a local file by
-  // joining its basename with the media dir.  Without a media dir, return the
-  // src verbatim (caller falls back to a stub if it does not exist).
-  std::string dir = media_dir_;
-  if (dir.empty()) {
-    const char* env = std::getenv("SHADERTOY_MEDIA_DIR");
-    if (env != nullptr)
-      dir = env;
-  }
-  if (dir.empty())
-    return src;
-  const std::filesystem::path p(src);
-  return (std::filesystem::path(dir) / p.filename()).string();
+  // Delegates: the mapping is shared with the Vulkan renderer, so it lives in
+  // one place rather than being reimplemented per backend.
+  return shadertoy::ResolveMediaPath(src, media_dir_);
 }
 
 GLuint GlRenderer::LoadCubemap(const Channel& ch) {

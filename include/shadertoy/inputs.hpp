@@ -22,18 +22,19 @@
 
 namespace shadertoy {
 
-// ── ShaderInputs ──────────────────────────────────────────────────────────────
-// Mirror of the Shadertoy uniform set, filled once per frame by the host and
-// consumed by whichever renderer (GL or Vulkan) is active.
+// ── ShaderInputs
+// ────────────────────────────────────────────────────────────── Mirror of the
+// Shadertoy uniform set, filled once per frame by the host and consumed by
+// whichever renderer (GL or Vulkan) is active.
 struct ShaderInputs {
-  float res_x = 0.0f;       // iResolution.x  (viewport width, pixels)
-  float res_y = 0.0f;       // iResolution.y  (viewport height, pixels)
-  float res_z = 1.0f;       // iResolution.z  (pixel aspect ratio, usually 1)
-  float time = 0.0f;        // iTime          (seconds since start)
-  float time_delta = 0.0f;  // iTimeDelta     (seconds since previous frame)
-  float frame_rate = 60.0f; // iFrameRate     (frames per second)
+  float res_x = 0.0f;        // iResolution.x  (viewport width, pixels)
+  float res_y = 0.0f;        // iResolution.y  (viewport height, pixels)
+  float res_z = 1.0f;        // iResolution.z  (pixel aspect ratio, usually 1)
+  float time = 0.0f;         // iTime          (seconds since start)
+  float time_delta = 0.0f;   // iTimeDelta     (seconds since previous frame)
+  float frame_rate = 60.0f;  // iFrameRate     (frames per second)
   float sample_rate = 44100.0f;  // iSampleRate (audio sample rate, Hz)
-  int32_t frame = 0;        // iFrame         (frame counter)
+  int32_t frame = 0;             // iFrame         (frame counter)
 
   // iMouse: xy = current pixel coords while a button is held; zw = pixel coords
   // of the last button-down (z/w sign encodes the click state, per Shadertoy).
@@ -43,16 +44,17 @@ struct ShaderInputs {
   float date_y = 0.0f, date_m = 0.0f, date_d = 0.0f, date_s = 0.0f;
 };
 
-// ── Vulkan push-constant block ────────────────────────────────────────────────
-// Packed to match the `layout(push_constant)` block emitted by the Vulkan
-// preamble.  96 bytes — within the 128-byte guaranteed minimum push-constant
-// size.  std430-compatible (all vec4/ivec4, 16-aligned).
+// ── Vulkan push-constant block
+// ──────────────────────────────────────────────── Packed to match the
+// `layout(push_constant)` block emitted by the Vulkan preamble.  96 bytes —
+// within the 128-byte guaranteed minimum push-constant size.  std430-compatible
+// (all vec4/ivec4, 16-aligned).
 struct PushConstants {
   float iResolution[4];  // xyz used, w padding
   float iMouse[4];
   float iDate[4];
-  float iTimePack[4];    // x=iTime y=iTimeDelta z=iFrameRate w=iSampleRate
-  int32_t iFramePack[4]; // x=iFrame, rest padding
+  float iTimePack[4];     // x=iTime y=iTimeDelta z=iFrameRate w=iSampleRate
+  int32_t iFramePack[4];  // x=iFrame, rest padding
 };
 
 [[nodiscard]] inline PushConstants ToPushConstants(
@@ -81,7 +83,8 @@ struct PushConstants {
   return pc;
 }
 
-// ── Source assembly ───────────────────────────────────────────────────────────
+// ── Source assembly
+// ───────────────────────────────────────────────────────────
 
 /// Sampler dimensionality for a channel, so the wrapper declares iChannelN with
 /// the GLSL sampler type the pass actually samples (a cubemap shader does
@@ -101,9 +104,9 @@ enum class SamplerDim { k2D, kCube, k3D };
 /// Convenience: wrap a pass whose channels are all 2D (or unsampled).
 [[nodiscard]] inline std::string WrapGles(const std::string& common,
                                           const std::string& code) {
-  return WrapGles(common, code,
-                  {SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D,
-                   SamplerDim::k2D});
+  return WrapGles(
+      common, code,
+      {SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D});
 }
 
 /// Single-pass convenience: wrap bare Image code with no Common tab.
@@ -120,9 +123,9 @@ enum class SamplerDim { k2D, kCube, k3D };
 /// Convenience: wrap a pass whose channels are all 2D (or unsampled).
 [[nodiscard]] inline std::string WrapVulkan(const std::string& common,
                                             const std::string& code) {
-  return WrapVulkan(common, code,
-                    {SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D,
-                     SamplerDim::k2D});
+  return WrapVulkan(
+      common, code,
+      {SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D, SamplerDim::k2D});
 }
 
 /// Single-pass convenience: wrap bare Image code with no Common tab.
@@ -133,5 +136,15 @@ enum class SamplerDim { k2D, kCube, k3D };
 /// Read a Shadertoy Image shader from @p path.  Returns the file contents, or
 /// an empty string on failure (caller should fall back to DefaultImageShader).
 [[nodiscard]] std::string LoadShaderFile(const std::string& path);
+
+/// Map a Shadertoy media src ("/media/a/<hash>.png") onto a local file by
+/// joining its basename with @p media_dir. When @p media_dir is empty,
+/// SHADERTOY_MEDIA_DIR is consulted; with neither, @p src comes back verbatim
+/// and the caller falls back to a stub if it does not exist.
+///
+/// Shared: both renderers resolve the same paths, and a second copy would
+/// drift from this one the first time either changed.
+[[nodiscard]] std::string ResolveMediaPath(const std::string& src,
+                                           const std::string& media_dir);
 
 }  // namespace shadertoy

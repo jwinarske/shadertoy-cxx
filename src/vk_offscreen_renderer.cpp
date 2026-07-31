@@ -8,10 +8,16 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "shadertoy/inputs.hpp"  // ResolveMediaPath
 #include "shadertoy/spirv_compile.hpp"
+
+#include "stb_image.h"
 
 namespace shadertoy {
 namespace {
@@ -101,6 +107,13 @@ struct VkOffscreenApi {
   PFN_vkUpdateDescriptorSets UpdateDescriptorSets = nullptr;
   PFN_vkCreateSampler CreateSampler = nullptr;
   PFN_vkDestroySampler DestroySampler = nullptr;
+  PFN_vkCreateBuffer CreateBuffer = nullptr;
+  PFN_vkDestroyBuffer DestroyBuffer = nullptr;
+  PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
+  PFN_vkBindBufferMemory BindBufferMemory = nullptr;
+  PFN_vkMapMemory MapMemory = nullptr;
+  PFN_vkUnmapMemory UnmapMemory = nullptr;
+  PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
   PFN_vkCreateImage CreateImage = nullptr;
   PFN_vkDestroyImage DestroyImage = nullptr;
   PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
@@ -203,6 +216,14 @@ bool VkOffscreenApi::Load(PFN_vkGetInstanceProcAddr gipa,
   ST_VKO_DEVICE_FN(UpdateDescriptorSets, "vkUpdateDescriptorSets");
   ST_VKO_DEVICE_FN(CreateSampler, "vkCreateSampler");
   ST_VKO_DEVICE_FN(DestroySampler, "vkDestroySampler");
+  ST_VKO_DEVICE_FN(CreateBuffer, "vkCreateBuffer");
+  ST_VKO_DEVICE_FN(DestroyBuffer, "vkDestroyBuffer");
+  ST_VKO_DEVICE_FN(GetBufferMemoryRequirements,
+                   "vkGetBufferMemoryRequirements");
+  ST_VKO_DEVICE_FN(BindBufferMemory, "vkBindBufferMemory");
+  ST_VKO_DEVICE_FN(MapMemory, "vkMapMemory");
+  ST_VKO_DEVICE_FN(UnmapMemory, "vkUnmapMemory");
+  ST_VKO_DEVICE_FN(CmdCopyBufferToImage, "vkCmdCopyBufferToImage");
   ST_VKO_DEVICE_FN(CreateImage, "vkCreateImage");
   ST_VKO_DEVICE_FN(DestroyImage, "vkDestroyImage");
   ST_VKO_DEVICE_FN(GetImageMemoryRequirements, "vkGetImageMemoryRequirements");
@@ -275,6 +296,16 @@ struct PassVk {
   int target_buffer = -1;  // -1: the Image pass, drawn into the caller's target
 };
 
+// A decoded texture channel, cached by resolved path so several passes (or
+// several channels) sharing an image decode and upload it once.
+struct TextureVk {
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
 struct VkOffscreenRenderer::Impl {
   VkExternalDevice dev{};
   VkOffscreenConfig cfg{};
@@ -314,6 +345,13 @@ struct VkOffscreenRenderer::Impl {
   VkDeviceMemory stub_memory = VK_NULL_HANDLE;
   VkImageView stub_view = VK_NULL_HANDLE;
   VkSampler sampler = VK_NULL_HANDLE;
+  // Samplers keyed by the Channel's filter/wrap, built on demand. Shadertoy
+  // sets these per channel, and a nearest-filtered lookup table sampled
+  // linearly is a visibly different shader.
+  std::map<std::pair<int, int>, VkSampler> samplers;
+  // Decoded texture channels, keyed by resolved path.
+  std::map<std::string, TextureVk> textures;
+  std::string media_dir;
   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 
   VkCommandPool setup_pool = VK_NULL_HANDLE;
@@ -325,6 +363,17 @@ struct VkOffscreenRenderer::Impl {
 
   ~Impl() { Cleanup(); }
 
+  /// Record and submit the staging copy for a texture channel, leaving the
+  /// image in SHADER_READ_ONLY_OPTIMAL. Submits, like the stub texture does --
+  /// at SetProgram time, never per frame.
+  [[nodiscard]] bool UploadTexture(VkImage image,
+                                   VkBuffer staging,
+                                   uint32_t width,
+                                   uint32_t height);
+  [[nodiscard]] VkSampler SamplerFor(const Channel& ch);
+  /// Decode and upload @p ch's image, or return nullptr when it cannot be
+  /// loaded (the caller then binds the stub, as before).
+  [[nodiscard]] const TextureVk* TextureFor(const Channel& ch);
   [[nodiscard]] bool SelectBufferFormat();
   [[nodiscard]] bool CreateRenderPass();
   [[nodiscard]] bool CreateStubTexture();
@@ -594,6 +643,250 @@ bool VkOffscreenRenderer::Impl::CreateStubTexture() {
   ST_VKO_CHECK(api.CreateImageView(dev.device, &view, nullptr, &stub_view),
                "vkCreateImageView(stub) failed");
   return true;
+}
+
+// ── Texture channels
+// ──────────────────────────────────────────────────────────
+
+bool VkOffscreenRenderer::Impl::UploadTexture(VkImage image,
+                                              VkBuffer staging,
+                                              const uint32_t width,
+                                              const uint32_t height) {
+  VkCommandBufferAllocateInfo cba{};
+  cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cba.commandPool = setup_pool;
+  cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cba.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  ST_VKO_CHECK(api.AllocateCommandBuffers(dev.device, &cba, &cmd),
+               "vkAllocateCommandBuffers(texture) failed");
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  ST_VKO_CHECK(api.BeginCommandBuffer(cmd, &begin),
+               "vkBeginCommandBuffer(texture) failed");
+
+  VkImageMemoryBarrier to_dst{};
+  to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_dst.image = image;
+  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  to_dst.srcAccessMask = 0;
+  to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  api.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &to_dst);
+
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {width, height, 1};
+  api.CmdCopyBufferToImage(cmd, staging, image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  VkImageMemoryBarrier to_read = to_dst;
+  to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  api.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &to_read);
+
+  ST_VKO_CHECK(api.EndCommandBuffer(cmd), "vkEndCommandBuffer(texture) failed");
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  ST_VKO_CHECK(api.QueueSubmit(dev.queue, 1, &submit, VK_NULL_HANDLE),
+               "vkQueueSubmit(texture) failed");
+  ST_VKO_CHECK(api.QueueWaitIdle(dev.queue), "vkQueueWaitIdle(texture) failed");
+  api.FreeCommandBuffers(dev.device, setup_pool, 1, &cmd);
+  return true;
+}
+
+VkSampler VkOffscreenRenderer::Impl::SamplerFor(const Channel& ch) {
+  const auto key =
+      std::make_pair(static_cast<int>(ch.filter), static_cast<int>(ch.wrap));
+  if (const auto it = samplers.find(key); it != samplers.end()) {
+    return it->second;
+  }
+  // kMipmap is treated as linear: these images are uploaded with a single
+  // level, so asking for mipmapped minification would sample a level that does
+  // not exist. Generating the chain is a later change, not a silent one.
+  const VkFilter filter =
+      ch.filter == Filter::kNearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+  const VkSamplerAddressMode mode = ch.wrap == Wrap::kClamp
+                                        ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                        : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  VkSamplerCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  info.magFilter = filter;
+  info.minFilter = filter;
+  info.addressModeU = mode;
+  info.addressModeV = mode;
+  info.addressModeW = mode;
+  info.maxLod = VK_LOD_CLAMP_NONE;
+  VkSampler out = VK_NULL_HANDLE;
+  if (api.CreateSampler(dev.device, &info, nullptr, &out) != VK_SUCCESS) {
+    return sampler;  // fall back to the default rather than binding nothing
+  }
+  samplers.emplace(key, out);
+  return out;
+}
+
+const TextureVk* VkOffscreenRenderer::Impl::TextureFor(const Channel& ch) {
+  if (ch.texture_path.empty()) {
+    return nullptr;
+  }
+  const std::string path = ResolveMediaPath(ch.texture_path, media_dir);
+  // Keyed by resolved path and vflip: the same file sampled both ways is two
+  // different uploads, and Shadertoy defaults textures to flipped.
+  const std::string key = path + (ch.vflip ? "#flip" : "");
+  if (const auto it = textures.find(key); it != textures.end()) {
+    return &it->second;
+  }
+
+  stbi_set_flip_vertically_on_load(ch.vflip ? 1 : 0);
+  int w = 0;
+  int h = 0;
+  int comp = 0;
+  stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+  if (pixels == nullptr || w <= 0 || h <= 0) {
+    if (pixels != nullptr) {
+      stbi_image_free(pixels);
+    }
+    std::fprintf(stderr,
+                 "shadertoy: could not load texture channel '%s' (resolved to "
+                 "'%s'); sampling the black stub instead\n",
+                 ch.texture_path.c_str(), path.c_str());
+    return nullptr;
+  }
+  const auto width = static_cast<uint32_t>(w);
+  const auto height = static_cast<uint32_t>(h);
+  const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4;
+
+  TextureVk tex{};
+  tex.width = width;
+  tex.height = height;
+
+  // Staging buffer -> device-local image. This submits, like the stub texture
+  // does; it happens when a program is set, never per frame.
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+  bool ok = true;
+  VkBufferCreateInfo bci{};
+  bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bci.size = bytes;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ok = api.CreateBuffer(dev.device, &bci, nullptr, &staging) == VK_SUCCESS;
+  if (ok) {
+    VkMemoryRequirements req{};
+    api.GetBufferMemoryRequirements(dev.device, staging, &req);
+    uint32_t type_index = 0;
+    ok = FindMemoryType(req.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &type_index);
+    if (ok) {
+      VkMemoryAllocateInfo mai{};
+      mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = type_index;
+      ok = api.AllocateMemory(dev.device, &mai, nullptr, &staging_mem) ==
+           VK_SUCCESS;
+    }
+    if (ok) {
+      ok = api.BindBufferMemory(dev.device, staging, staging_mem, 0) ==
+           VK_SUCCESS;
+    }
+    if (ok) {
+      void* mapped = nullptr;
+      ok = api.MapMemory(dev.device, staging_mem, 0, bytes, 0, &mapped) ==
+           VK_SUCCESS;
+      if (ok) {
+        std::memcpy(mapped, pixels, static_cast<size_t>(bytes));
+        api.UnmapMemory(dev.device, staging_mem);
+      }
+    }
+  }
+  stbi_image_free(pixels);
+
+  if (ok) {
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ok = api.CreateImage(dev.device, &ici, nullptr, &tex.image) == VK_SUCCESS;
+  }
+  if (ok) {
+    VkMemoryRequirements req{};
+    api.GetImageMemoryRequirements(dev.device, tex.image, &req);
+    uint32_t type_index = 0;
+    ok = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        &type_index);
+    if (ok) {
+      VkMemoryAllocateInfo mai{};
+      mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = type_index;
+      ok = api.AllocateMemory(dev.device, &mai, nullptr, &tex.memory) ==
+           VK_SUCCESS;
+    }
+    if (ok) {
+      ok = api.BindImageMemory(dev.device, tex.image, tex.memory, 0) ==
+           VK_SUCCESS;
+    }
+  }
+  if (ok) {
+    ok = UploadTexture(tex.image, staging, width, height);
+  }
+  if (ok) {
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = tex.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    ok =
+        api.CreateImageView(dev.device, &vci, nullptr, &tex.view) == VK_SUCCESS;
+  }
+
+  if (staging != VK_NULL_HANDLE) {
+    api.DestroyBuffer(dev.device, staging, nullptr);
+  }
+  if (staging_mem != VK_NULL_HANDLE) {
+    api.FreeMemory(dev.device, staging_mem, nullptr);
+  }
+  if (!ok) {
+    if (tex.view != VK_NULL_HANDLE) {
+      api.DestroyImageView(dev.device, tex.view, nullptr);
+    }
+    if (tex.image != VK_NULL_HANDLE) {
+      api.DestroyImage(dev.device, tex.image, nullptr);
+    }
+    if (tex.memory != VK_NULL_HANDLE) {
+      api.FreeMemory(dev.device, tex.memory, nullptr);
+    }
+    std::fprintf(stderr,
+                 "shadertoy: failed to upload texture channel '%s'; sampling "
+                 "the black stub instead\n",
+                 ch.texture_path.c_str());
+    return nullptr;
+  }
+  const auto [it, inserted] = textures.emplace(key, tex);
+  return &it->second;
 }
 
 // ── Descriptors
@@ -928,14 +1221,22 @@ void VkOffscreenRenderer::Impl::WriteDescriptorSets() {
       for (uint32_t i = 0; i < kChannelCount; ++i) {
         const Channel& ch = pass.channels[i];
         VkImageView view = stub_view;
+        VkSampler chan_sampler = sampler;
         if (ch.kind == ChannelKind::kBuffer && ch.buffer >= 0 &&
             ch.buffer < kNumBuffers) {
           const BufferVk& src = buffers[static_cast<size_t>(ch.buffer)];
           if (src.used && src.view[parity] != VK_NULL_HANDLE) {
             view = src.view[parity];
           }
+        } else if (ch.kind == ChannelKind::kTexture) {
+          // Falls through to the stub when the file cannot be found or
+          // decoded, which TextureFor has already reported.
+          if (const TextureVk* tex = TextureFor(ch); tex != nullptr) {
+            view = tex->view;
+            chan_sampler = SamplerFor(ch);
+          }
         }
-        infos[i].sampler = sampler;
+        infos[i].sampler = chan_sampler;
         infos[i].imageView = view;
         infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1134,6 +1435,22 @@ void VkOffscreenRenderer::Impl::Cleanup() {
     api.DestroyDescriptorSetLayout(dev.device, set_layout, nullptr);
     set_layout = VK_NULL_HANDLE;
   }
+  for (auto& [key, tex] : textures) {
+    if (tex.view != VK_NULL_HANDLE) {
+      api.DestroyImageView(dev.device, tex.view, nullptr);
+    }
+    if (tex.image != VK_NULL_HANDLE) {
+      api.DestroyImage(dev.device, tex.image, nullptr);
+    }
+    if (tex.memory != VK_NULL_HANDLE) {
+      api.FreeMemory(dev.device, tex.memory, nullptr);
+    }
+  }
+  textures.clear();
+  for (auto& [key, s] : samplers) {
+    api.DestroySampler(dev.device, s, nullptr);
+  }
+  samplers.clear();
   if (sampler != VK_NULL_HANDLE) {
     api.DestroySampler(dev.device, sampler, nullptr);
     sampler = VK_NULL_HANDLE;
@@ -1205,6 +1522,10 @@ bool VkOffscreenRenderer::SetProgram(const ShaderProgram& program) {
   // channel will not compile -- unchanged from before multi-pass. What is new
   // is that a kBuffer channel now names a real image.
   return impl_->BuildProgram(program);
+}
+
+void VkOffscreenRenderer::SetMediaDir(std::string dir) {
+  impl_->media_dir = std::move(dir);
 }
 
 bool VkOffscreenRenderer::Init(const std::string& image_shader) {
