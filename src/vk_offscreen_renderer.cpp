@@ -352,6 +352,8 @@ struct VkOffscreenRenderer::Impl {
   // Decoded texture channels, keyed by resolved path.
   std::map<std::string, TextureVk> textures;
   std::string media_dir;
+  // Diagnostics from the most recent BuildProgram; empty on success.
+  std::string compile_log;
   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 
   VkCommandPool setup_pool = VK_NULL_HANDLE;
@@ -386,7 +388,8 @@ struct VkOffscreenRenderer::Impl {
   [[nodiscard]] bool MakePipeline(const std::string& frag_glsl,
                                   VkRenderPass pass,
                                   VkPipeline* out_pipeline,
-                                  VkShaderModule* out_frag);
+                                  VkShaderModule* out_frag,
+                                  std::string* log = nullptr);
   [[nodiscard]] VkFramebuffer FramebufferFor(const VkOffscreenTarget& target);
   void Cleanup();
 
@@ -947,7 +950,8 @@ VkShaderModule VkOffscreenRenderer::Impl::MakeModule(
 bool VkOffscreenRenderer::Impl::MakePipeline(const std::string& frag_glsl,
                                              VkRenderPass pass,
                                              VkPipeline* out_pipeline,
-                                             VkShaderModule* out_frag) {
+                                             VkShaderModule* out_frag,
+                                             std::string* log) {
   // The vertex stage is the same generated full-screen triangle for every pass,
   // so it is compiled once and shared rather than per pass.
   if (vert_module == VK_NULL_HANDLE) {
@@ -960,7 +964,7 @@ bool VkOffscreenRenderer::Impl::MakePipeline(const std::string& frag_glsl,
     }
   }
   const std::vector<uint32_t> frag_spirv =
-      CompileToSpirv(frag_glsl, ShaderStage::kFragment);
+      CompileToSpirv(frag_glsl, ShaderStage::kFragment, log);
   if (frag_spirv.empty()) {
     std::fprintf(stderr, "shadertoy: GLSL to SPIR-V compilation failed\n");
     return false;
@@ -1294,12 +1298,28 @@ bool VkOffscreenRenderer::Impl::BuildProgram(const ShaderProgram& src) {
 
   // Compile and build every pipeline before touching live state, so a program
   // that fails to compile leaves the previous one running.
+  compile_log.clear();
   bool ok = true;
   for (size_t i = 0; i < built.size() && ok; ++i) {
     const std::string frag = WrapVulkan(src.common, sources[i]->code);
     VkRenderPass pass =
         built[i].target_buffer < 0 ? render_pass : buffer_render_pass;
-    ok = MakePipeline(frag, pass, &built[i].pipeline, &built[i].frag);
+    std::string pass_log;
+    ok =
+        MakePipeline(frag, pass, &built[i].pipeline, &built[i].frag, &pass_log);
+    if (!pass_log.empty()) {
+      // Name the pass: "it failed" is much less useful than "Buffer B failed"
+      // when a program has five of them, and the line numbers in the log are
+      // relative to that pass's wrapped source.
+      if (built[i].target_buffer < 0) {
+        compile_log.append("Image pass:\n");
+      } else {
+        compile_log.append("Buffer ");
+        compile_log.push_back(static_cast<char>('A' + built[i].target_buffer));
+        compile_log.append(" pass:\n");
+      }
+      compile_log.append(pass_log);
+    }
   }
 
   VkDescriptorPool new_pool = VK_NULL_HANDLE;
@@ -1522,6 +1542,10 @@ bool VkOffscreenRenderer::SetProgram(const ShaderProgram& program) {
   // channel will not compile -- unchanged from before multi-pass. What is new
   // is that a kBuffer channel now names a real image.
   return impl_->BuildProgram(program);
+}
+
+const std::string& VkOffscreenRenderer::last_compile_log() const {
+  return impl_->compile_log;
 }
 
 void VkOffscreenRenderer::SetMediaDir(std::string dir) {

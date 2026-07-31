@@ -40,7 +40,25 @@ bool HaveLinkedSpirvCompiler() {
 }
 
 std::vector<uint32_t> CompileToSpirvLinked(const std::string& glsl_source,
-                                           const ShaderStage stage) {
+                                           const ShaderStage stage,
+                                           std::string* log) {
+  // Report to stderr and to the caller's buffer both: stderr is where a
+  // developer looks, the buffer is what a host can put in front of a user.
+  const auto record = [log](const char* what, const char* info,
+                            const char* debug) {
+    std::fprintf(stderr, "shadertoy: %s:\n%s%s\n", what,
+                 info != nullptr ? info : "", debug != nullptr ? debug : "");
+    if (log != nullptr) {
+      log->append(what);
+      log->append(":\n");
+      if (info != nullptr) {
+        log->append(info);
+      }
+      if (debug != nullptr) {
+        log->append(debug);
+      }
+    }
+  };
   EnsureGlslangInitialized();
 
   glslang_input_t input{};
@@ -61,31 +79,26 @@ std::vector<uint32_t> CompileToSpirvLinked(const std::string& glsl_source,
 
   glslang_shader_t* shader = glslang_shader_create(&input);
   if (shader == nullptr) {
-    std::fprintf(stderr, "shadertoy: glslang_shader_create failed\n");
+    record("glslang_shader_create failed", nullptr, nullptr);
     return {};
   }
 
-  // Diagnostics go to stderr to match the subprocess path, which inherits the
-  // compiler's own output. A caller that wants the log has the same access
-  // either way.
   if (glslang_shader_preprocess(shader, &input) == 0) {
-    std::fprintf(stderr, "shadertoy: GLSL preprocess failed:\n%s%s\n",
-                 glslang_shader_get_info_log(shader),
-                 glslang_shader_get_info_debug_log(shader));
+    record("GLSL preprocess failed", glslang_shader_get_info_log(shader),
+           glslang_shader_get_info_debug_log(shader));
     glslang_shader_delete(shader);
     return {};
   }
   if (glslang_shader_parse(shader, &input) == 0) {
-    std::fprintf(stderr, "shadertoy: GLSL parse failed:\n%s%s\n",
-                 glslang_shader_get_info_log(shader),
-                 glslang_shader_get_info_debug_log(shader));
+    record("GLSL parse failed", glslang_shader_get_info_log(shader),
+           glslang_shader_get_info_debug_log(shader));
     glslang_shader_delete(shader);
     return {};
   }
 
   glslang_program_t* program = glslang_program_create();
   if (program == nullptr) {
-    std::fprintf(stderr, "shadertoy: glslang_program_create failed\n");
+    record("glslang_program_create failed", nullptr, nullptr);
     glslang_shader_delete(shader);
     return {};
   }
@@ -93,9 +106,8 @@ std::vector<uint32_t> CompileToSpirvLinked(const std::string& glsl_source,
 
   if (glslang_program_link(program, GLSLANG_MSG_SPV_RULES_BIT |
                                         GLSLANG_MSG_VULKAN_RULES_BIT) == 0) {
-    std::fprintf(stderr, "shadertoy: GLSL link failed:\n%s%s\n",
-                 glslang_program_get_info_log(program),
-                 glslang_program_get_info_debug_log(program));
+    record("GLSL link failed", glslang_program_get_info_log(program),
+           glslang_program_get_info_debug_log(program));
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     return {};
@@ -117,7 +129,7 @@ std::vector<uint32_t> CompileToSpirvLinked(const std::string& glsl_source,
   glslang_shader_delete(shader);
 
   if (spirv.empty()) {
-    std::fprintf(stderr, "shadertoy: glslang produced no SPIR-V\n");
+    record("glslang produced no SPIR-V", nullptr, nullptr);
   }
   return spirv;
 }

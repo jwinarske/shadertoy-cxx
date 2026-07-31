@@ -32,7 +32,8 @@ namespace shadertoy {
 /// having reported the log to stderr.
 [[nodiscard]] std::vector<uint32_t> CompileToSpirvLinked(
     const std::string& glsl_source,
-    ShaderStage stage);
+    ShaderStage stage,
+    std::string* log);
 
 }  // namespace shadertoy
 

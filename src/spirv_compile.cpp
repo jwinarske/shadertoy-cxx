@@ -14,6 +14,7 @@
 #include "spirv_compile_backend.hpp"
 
 extern "C" {
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 }
@@ -36,7 +37,8 @@ bool HaveLinkedSpirvCompiler() {
   return false;
 }
 std::vector<uint32_t> CompileToSpirvLinked(const std::string& /*glsl_source*/,
-                                           ShaderStage /*stage*/) {
+                                           ShaderStage /*stage*/,
+                                           std::string* /*log*/) {
   return {};
 }
 #endif
@@ -69,12 +71,26 @@ namespace {
 }
 
 // Run a NULL-terminated argv and return its exit status, or -1 on spawn
-// failure.  stdout/stderr are inherited so compiler diagnostics reach the user.
-[[nodiscard]] int RunCompiler(const std::vector<char*>& argv) {
+// failure.
+//
+// With @p capture_path set, the child's stdout and stderr are redirected there
+// rather than inherited, so the caller can read the diagnostics back. A file
+// rather than a pipe: the compiler can outproduce a pipe buffer on a shader
+// with many errors, and a parent that waits before draining would deadlock.
+[[nodiscard]] int RunCompiler(const std::vector<char*>& argv,
+                              const char* capture_path = nullptr) {
   const pid_t pid = ::fork();
   if (pid < 0)
     return -1;
   if (pid == 0) {
+    if (capture_path != nullptr) {
+      const int fd = ::open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (fd >= 0) {
+        ::dup2(fd, STDOUT_FILENO);
+        ::dup2(fd, STDERR_FILENO);
+        ::close(fd);
+      }
+    }
     ::execvp(argv.front(), argv.data());
     ::_exit(127);  // reached only if exec failed
   }
@@ -86,6 +102,22 @@ namespace {
   if (WIFEXITED(status))
     return WEXITSTATUS(status);
   return -1;
+}
+
+// Read a captured diagnostics file back, capped: a shader with hundreds of
+// errors should not hand a host an unbounded string to render.
+[[nodiscard]] std::string ReadCapture(const std::string& path) {
+  constexpr std::streamsize kMaxLog = 64 * 1024;
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return {};
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  if (static_cast<std::streamsize>(text.size()) > kMaxLog) {
+    text.resize(static_cast<size_t>(kMaxLog));
+    text.append("\n... (truncated)");
+  }
+  return text;
 }
 
 [[nodiscard]] std::vector<uint32_t> ReadSpirv(const std::string& path) {
@@ -110,7 +142,8 @@ namespace {
 }  // namespace
 
 std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
-                                     ShaderStage stage) {
+                                     ShaderStage stage,
+                                     std::string* log) {
   // SHADERTOY_GLSLANG names a binary, so setting it is a deliberate request for
   // the subprocess path -- the escape hatch that lets a deployment swap the
   // compiler without rebuilding, and the reason the linked backend is an option
@@ -120,7 +153,7 @@ std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
       (override_bin == nullptr || *override_bin == '\0')) {
     // Authoritative when present: a failure here is the shader's, and retrying
     // it through a subprocess would only report the same error twice.
-    return CompileToSpirvLinked(glsl_source, stage);
+    return CompileToSpirvLinked(glsl_source, stage, log);
   }
 
   const char* tmpdir_env = std::getenv("TMPDIR");
@@ -144,13 +177,20 @@ std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
     return {};
   }
 
+  // Only captured when the caller asked for it: redirecting otherwise would
+  // take the compiler's output away from the terminal for no gain.
+  const std::string capture =
+      log != nullptr ? WriteTempFile(tmpdir + "/shadertoy-XXXXXX.log", "", 4)
+                     : std::string();
+  const char* capture_path = capture.empty() ? nullptr : capture.c_str();
+
   std::vector<uint32_t> spirv;
   auto try_glslang = [&](const char* prog) -> bool {
     // glslangValidator -V <in> -o <out>
     std::string p = prog, v = "-V", o = "-o";
     std::vector<char*> argv = {p.data(), v.data(),        in_path.data(),
                                o.data(), out_path.data(), nullptr};
-    if (RunCompiler(argv) != 0)
+    if (RunCompiler(argv, capture_path) != 0)
       return false;
     spirv = ReadSpirv(out_path);
     return !spirv.empty();
@@ -160,7 +200,7 @@ std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
     std::string p = prog, st = glslc_stage, o = "-o";
     std::vector<char*> argv = {p.data(), st.data(),       in_path.data(),
                                o.data(), out_path.data(), nullptr};
-    if (RunCompiler(argv) != 0)
+    if (RunCompiler(argv, capture_path) != 0)
       return false;
     spirv = ReadSpirv(out_path);
     return !spirv.empty();
@@ -174,13 +214,31 @@ std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
     ok = try_glslang("glslangValidator") || try_glslc("glslc");
   }
 
+  // Echo what was captured, so redirecting the child does not cost the
+  // developer the diagnostics they would otherwise have seen inherited.
+  if (capture_path != nullptr) {
+    std::string text = ReadCapture(capture);
+    if (!text.empty()) {
+      std::fputs(text.c_str(), stderr);
+      if (log != nullptr) {
+        log->append(text);
+      }
+    }
+    ::unlink(capture.c_str());
+  }
   ::unlink(in_path.c_str());
   ::unlink(out_path.c_str());
 
   if (!ok) {
-    std::fprintf(stderr,
-                 "shadertoy: SPIR-V compilation failed (need glslangValidator "
-                 "or glslc on PATH, or set SHADERTOY_GLSLANG)\n");
+    constexpr const char* kNoCompiler =
+        "SPIR-V compilation failed (need glslangValidator or glslc on PATH, or "
+        "set SHADERTOY_GLSLANG)";
+    std::fprintf(stderr, "shadertoy: %s\n", kNoCompiler);
+    if (log != nullptr && log->empty()) {
+      // Nothing captured means no compiler ran at all, which is a different
+      // problem from a shader the compiler rejected -- say which.
+      log->assign(kNoCompiler);
+    }
     return {};
   }
   return spirv;
