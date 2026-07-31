@@ -120,6 +120,14 @@ class VkOffscreenRenderer {
   /// sampler2D and a shader sampling a cubemap channel will not compile.
   [[nodiscard]] bool SetProgram(const ShaderProgram& program);
 
+  /// The compiler's diagnostics from the most recent SetProgram, or empty when
+  /// it succeeded. Cleared at the start of every SetProgram, so it always
+  /// describes the latest attempt rather than an older failure.
+  ///
+  /// A failed SetProgram leaves the previous program running, so a host can
+  /// show this without the view going blank.
+  [[nodiscard]] const std::string& last_compile_log() const;
+
   /// Base directory for resolving a texture channel's Shadertoy media src
   /// ("/media/a/<hash>.png") onto a local file, mirroring
   /// GlRenderer::SetMediaDir. Unset falls back to SHADERTOY_MEDIA_DIR. Set it

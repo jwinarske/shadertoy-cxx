@@ -21,9 +21,18 @@ namespace shadertoy {
 enum class ShaderStage { kVertex, kFragment };
 
 /// Compile a complete Vulkan GLSL shader (@p glsl_source) of the given
-/// @p stage to SPIR-V.  Returns the SPIR-V words, or an empty vector on failure
-/// (diagnostics are printed to stderr by the underlying compiler).
-[[nodiscard]] std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
-                                                   ShaderStage stage);
+/// @p stage to SPIR-V.  Returns the SPIR-V words, or an empty vector on
+/// failure.
+///
+/// When @p log is non-null it receives the compiler's diagnostics — the reason
+/// a shader was rejected, with line numbers — so a host can show them rather
+/// than only reporting that something failed. Diagnostics still go to stderr
+/// either way, since that is where a developer looks first. The linked and
+/// subprocess back-ends both fill it; the subprocess one captures the child's
+/// stderr to do so.
+[[nodiscard]] std::vector<uint32_t> CompileToSpirv(
+    const std::string& glsl_source,
+    ShaderStage stage,
+    std::string* log = nullptr);
 
 }  // namespace shadertoy
