@@ -365,6 +365,26 @@ struct VkOffscreenRenderer::Impl {
   VkImageView stub_view = VK_NULL_HANDLE;
   TextureVk stub_cube{};
   TextureVk stub_volume{};
+
+  // Audio channel: a 512x2 R8 image the capture source refills every frame.
+  // Unlike every other channel this is not uploaded once -- so the copy is
+  // recorded into the caller's command buffer rather than submitted here,
+  // preserving "RecordRender submits nothing".
+  TextureVk audio_image{};
+  VkBuffer audio_staging = VK_NULL_HANDLE;
+  VkDeviceMemory audio_staging_memory = VK_NULL_HANDLE;
+  void* audio_mapped = nullptr;
+  std::shared_ptr<AudioSource> audio;
+  bool audio_enabled = true;
+  bool audio_custom_set = false;  // a source came from SetAudioSource
+  bool audio_started = false;
+  bool audio_failed = false;  // latched: a failed open is not retried
+  bool uses_audio = false;    // the current program binds a kAudio channel
+  int64_t audio_frame = -1;   // guards one refill per frame
+  // Disabling audio has to push one frame of silence: simply ceasing to refill
+  // would leave the last capture frozen in the image, which reads as audio
+  // that stopped responding rather than audio that is off.
+  bool audio_silence_pending = false;
   VkSampler sampler = VK_NULL_HANDLE;
   // Samplers keyed by the Channel's filter/wrap, built on demand. Shadertoy
   // sets these per channel, and a nearest-filtered lookup table sampled
@@ -414,6 +434,15 @@ struct VkOffscreenRenderer::Impl {
                                         TextureVk* out);
   /// The stub matching @p dim, built on first use.
   [[nodiscard]] VkImageView StubViewFor(ChannelDim dim);
+  /// Create the audio image and its persistent mapped staging buffer. Called
+  /// on first use, so a program without an audio channel allocates neither.
+  [[nodiscard]] bool EnsureAudioImage();
+  /// Pull a frame of capture into the staging buffer and record the copy into
+  /// @p cmd. No-op when the program binds no audio channel, when capture is
+  /// disabled, or when this frame already refilled it.
+  void RecordAudioUpdate(VkCommandBuffer cmd, const ShaderInputs& inputs);
+  /// Record the staging-buffer-to-image copy and its barriers into @p cmd.
+  void RecordAudioCopy(VkCommandBuffer cmd);
   [[nodiscard]] bool SelectBufferFormat();
   [[nodiscard]] bool CreateRenderPass();
   [[nodiscard]] bool CreateStubTexture();
@@ -684,6 +713,184 @@ bool VkOffscreenRenderer::Impl::CreateStubTexture() {
   ST_VKO_CHECK(api.CreateImageView(dev.device, &view, nullptr, &stub_view),
                "vkCreateImageView(stub) failed");
   return true;
+}
+
+// ── Audio channel
+// ────────────────────────────────────────────────────────────
+
+bool VkOffscreenRenderer::Impl::EnsureAudioImage() {
+  if (audio_image.view != VK_NULL_HANDLE) {
+    return true;
+  }
+  constexpr uint32_t kW = static_cast<uint32_t>(kAudioTexWidth);
+  constexpr uint32_t kH = 2;
+
+  // R8: the capture fills one byte per texel -- row 0 the FFT, row 1 the
+  // waveform -- and the shader reads .x, matching the GL renderer's GL_R8.
+  VkImageCreateInfo ici{};
+  ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = VK_FORMAT_R8_UNORM;
+  ici.extent = {kW, kH, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  ST_VKO_CHECK(api.CreateImage(dev.device, &ici, nullptr, &audio_image.image),
+               "vkCreateImage(audio) failed");
+
+  VkMemoryRequirements req{};
+  api.GetImageMemoryRequirements(dev.device, audio_image.image, &req);
+  uint32_t type_index = 0;
+  if (!FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                      &type_index)) {
+    return false;
+  }
+  VkMemoryAllocateInfo mai{};
+  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex = type_index;
+  ST_VKO_CHECK(
+      api.AllocateMemory(dev.device, &mai, nullptr, &audio_image.memory),
+      "vkAllocateMemory(audio) failed");
+  ST_VKO_CHECK(
+      api.BindImageMemory(dev.device, audio_image.image, audio_image.memory, 0),
+      "vkBindImageMemory(audio) failed");
+
+  VkImageViewCreateInfo vci{};
+  vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  vci.image = audio_image.image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = VK_FORMAT_R8_UNORM;
+  vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  ST_VKO_CHECK(
+      api.CreateImageView(dev.device, &vci, nullptr, &audio_image.view),
+      "vkCreateImageView(audio) failed");
+  audio_image.width = kW;
+  audio_image.height = kH;
+
+  // The staging buffer is persistent and stays mapped: this is refilled every
+  // frame, so mapping and unmapping per frame would be pure overhead.
+  VkBufferCreateInfo bci{};
+  bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bci.size = static_cast<VkDeviceSize>(kAudioTexBytes);
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ST_VKO_CHECK(api.CreateBuffer(dev.device, &bci, nullptr, &audio_staging),
+               "vkCreateBuffer(audio) failed");
+  VkMemoryRequirements breq{};
+  api.GetBufferMemoryRequirements(dev.device, audio_staging, &breq);
+  if (!FindMemoryType(breq.memoryTypeBits,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      &type_index)) {
+    return false;
+  }
+  mai.allocationSize = breq.size;
+  mai.memoryTypeIndex = type_index;
+  ST_VKO_CHECK(
+      api.AllocateMemory(dev.device, &mai, nullptr, &audio_staging_memory),
+      "vkAllocateMemory(audio staging) failed");
+  ST_VKO_CHECK(
+      api.BindBufferMemory(dev.device, audio_staging, audio_staging_memory, 0),
+      "vkBindBufferMemory(audio) failed");
+  ST_VKO_CHECK(api.MapMemory(dev.device, audio_staging_memory, 0,
+                             static_cast<VkDeviceSize>(kAudioTexBytes), 0,
+                             &audio_mapped),
+               "vkMapMemory(audio) failed");
+  // Silent until the first capture lands, so a frame recorded before any audio
+  // arrives samples zeros rather than uninitialized memory.
+  std::memset(audio_mapped, 0, static_cast<size_t>(kAudioTexBytes));
+  return true;
+}
+
+void VkOffscreenRenderer::Impl::RecordAudioUpdate(VkCommandBuffer cmd,
+                                                  const ShaderInputs& inputs) {
+  if (!uses_audio || audio_failed) {
+    return;
+  }
+  if (audio_silence_pending) {
+    if (EnsureAudioImage()) {
+      std::memset(audio_mapped, 0, static_cast<size_t>(kAudioTexBytes));
+      RecordAudioCopy(cmd);
+    }
+    audio_silence_pending = false;
+    return;
+  }
+  // Lazily open the default microphone the first time audio is actually
+  // needed, matching GlRenderer.
+  if (audio == nullptr) {
+    if (audio_custom_set || !audio_enabled) {
+      return;  // explicitly disabled, or a null custom source was set
+    }
+    audio = MakeMicSource();
+    if (audio == nullptr) {
+      audio_failed = true;  // no capture back-end compiled in
+      return;
+    }
+  }
+  // An injected source is started and stopped by its owner; only the lazily
+  // created default one is this renderer's to drive.
+  if (!audio_custom_set && !audio_started) {
+    if (!audio->Start()) {
+      audio.reset();
+      audio_failed = true;  // no device or permission: do not retry
+      return;
+    }
+    audio_started = true;
+  }
+  if (inputs.frame == audio_frame) {
+    return;  // already refilled this frame; several passes may sample audio
+  }
+  if (!EnsureAudioImage()) {
+    audio_failed = true;
+    return;
+  }
+  audio_frame = inputs.frame;
+  if (!audio->Fill(static_cast<unsigned char*>(audio_mapped))) {
+    return;  // no new capture this frame; the image keeps the last one
+  }
+
+  RecordAudioCopy(cmd);
+}
+
+void VkOffscreenRenderer::Impl::RecordAudioCopy(VkCommandBuffer cmd) {
+  const auto barrier =
+      [&](VkImageLayout old_layout, VkImageLayout new_layout,
+          VkAccessFlags src_access, VkPipelineStageFlags src_stage,
+          VkAccessFlags dst_access, VkPipelineStageFlags dst_stage) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = old_layout;
+        b.newLayout = new_layout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = audio_image.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = src_access;
+        b.dstAccessMask = dst_access;
+        api.CmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0,
+                               nullptr, 1, &b);
+      };
+
+  // UNDEFINED as the source layout: the previous contents are last frame's
+  // capture, which this overwrites completely, so there is nothing to preserve
+  // and the driver is free to discard.
+  barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {audio_image.width, audio_image.height, 1};
+  api.CmdCopyBufferToImage(cmd, audio_staging, audio_image.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 }
 
 // ── Texture channels
@@ -1552,6 +1759,13 @@ void VkOffscreenRenderer::Impl::WriteDescriptorSets() {
             view = tex->view;
             chan_sampler = SamplerFor(ch);
           }
+        } else if (ch.kind == ChannelKind::kAudio) {
+          // Created here rather than at first capture: the descriptor has to
+          // name a real view now, and a silent image is the correct reading
+          // until a frame of audio lands.
+          if (EnsureAudioImage()) {
+            view = audio_image.view;
+          }
         }
         infos[i].sampler = chan_sampler;
         infos[i].imageView = view;
@@ -1714,6 +1928,16 @@ bool VkOffscreenRenderer::Impl::BuildProgram(const ShaderProgram& src) {
   passes = std::move(built);
   descriptor_pool = new_pool;
   program = src;
+  // Whether to open a capture device at all is a property of the program, so
+  // it is answered here rather than probed per frame.
+  uses_audio = false;
+  for (const PassVk& p : passes) {
+    for (const Channel& ch : p.channels) {
+      if (ch.kind == ChannelKind::kAudio) {
+        uses_audio = true;
+      }
+    }
+  }
   front = 0;
   sets_written = false;
   // Sets are written once the buffers exist, which RecordRender arranges as
@@ -1802,6 +2026,31 @@ void VkOffscreenRenderer::Impl::Cleanup() {
     }
   }
   textures.clear();
+  if (audio_started && audio != nullptr && !audio_custom_set) {
+    audio->Stop();  // only the source this renderer opened is its to close
+  }
+  if (audio_mapped != nullptr) {
+    api.UnmapMemory(dev.device, audio_staging_memory);
+    audio_mapped = nullptr;
+  }
+  if (audio_staging != VK_NULL_HANDLE) {
+    api.DestroyBuffer(dev.device, audio_staging, nullptr);
+    audio_staging = VK_NULL_HANDLE;
+  }
+  if (audio_staging_memory != VK_NULL_HANDLE) {
+    api.FreeMemory(dev.device, audio_staging_memory, nullptr);
+    audio_staging_memory = VK_NULL_HANDLE;
+  }
+  if (audio_image.view != VK_NULL_HANDLE) {
+    api.DestroyImageView(dev.device, audio_image.view, nullptr);
+  }
+  if (audio_image.image != VK_NULL_HANDLE) {
+    api.DestroyImage(dev.device, audio_image.image, nullptr);
+  }
+  if (audio_image.memory != VK_NULL_HANDLE) {
+    api.FreeMemory(dev.device, audio_image.memory, nullptr);
+  }
+  audio_image = TextureVk{};
   for (TextureVk* stub : {&stub_cube, &stub_volume}) {
     if (stub->view != VK_NULL_HANDLE) {
       api.DestroyImageView(dev.device, stub->view, nullptr);
@@ -1895,6 +2144,26 @@ const std::string& VkOffscreenRenderer::last_compile_log() const {
   return impl_->compile_log;
 }
 
+void VkOffscreenRenderer::SetAudioSource(
+    std::shared_ptr<AudioSource> src) noexcept {
+  // Setting a source -- including a null one -- takes the default microphone
+  // out of play, so a caller can disable audio outright by passing null.
+  impl_->audio = std::move(src);
+  impl_->audio_custom_set = true;
+  impl_->audio_started = false;
+  impl_->audio_failed = false;
+  if (impl_->audio == nullptr) {
+    impl_->audio_silence_pending = true;
+  }
+}
+
+void VkOffscreenRenderer::SetAudioEnabled(const bool enabled) noexcept {
+  impl_->audio_enabled = enabled;
+  if (!enabled) {
+    impl_->audio_silence_pending = true;
+  }
+}
+
 void VkOffscreenRenderer::SetMediaDir(std::string dir) {
   impl_->media_dir = std::move(dir);
 }
@@ -1963,6 +2232,10 @@ bool VkOffscreenRenderer::RecordRender(VkCommandBuffer cmd,
     }
     impl.buffers_need_layout_init = false;
   }
+
+  // Before any pass samples it, and in the caller's command buffer so this
+  // still submits nothing.
+  impl.RecordAudioUpdate(cmd, inputs);
 
   const PushConstants push = ToPushConstants(inputs);
   const uint32_t parity = impl.front;
