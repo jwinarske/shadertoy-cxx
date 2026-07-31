@@ -120,6 +120,12 @@ class VkOffscreenRenderer {
   /// sampler2D and a shader sampling a cubemap channel will not compile.
   [[nodiscard]] bool SetProgram(const ShaderProgram& program);
 
+  /// Base directory for resolving a texture channel's Shadertoy media src
+  /// ("/media/a/<hash>.png") onto a local file, mirroring
+  /// GlRenderer::SetMediaDir. Unset falls back to SHADERTOY_MEDIA_DIR. Set it
+  /// before SetProgram: channels are resolved as the program is built.
+  void SetMediaDir(std::string dir);
+
   /// Single-pass convenience, mirroring GlRenderer::Init.
   [[nodiscard]] bool Init(const std::string& image_shader);
 

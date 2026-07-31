@@ -184,9 +184,14 @@ set(SHADERTOY_PUBLIC_HEADERS
     ${CMAKE_CURRENT_BINARY_DIR}/include/shadertoy/config.hpp)
 
 if(HAVE_GL)
-  # gl_renderer pulls in stb_image (vendored) for texture channels.
-  list(APPEND SHADERTOY_SOURCES src/gl_renderer.cpp src/stb_image_impl.cpp)
+  list(APPEND SHADERTOY_SOURCES src/gl_renderer.cpp)
   list(APPEND SHADERTOY_PUBLIC_HEADERS include/shadertoy/gl_renderer.hpp)
+endif()
+# stb_image is the single translation unit instantiating the library, and both
+# renderers decode texture channels through it -- so it is gated on either
+# back-end rather than on GL, and listed once so it is never compiled twice.
+if(HAVE_GL OR HAVE_VULKAN)
+  list(APPEND SHADERTOY_SOURCES src/stb_image_impl.cpp)
 endif()
 if(HAVE_VULKAN)
   list(APPEND SHADERTOY_SOURCES src/spirv_compile.cpp src/vk_renderer.cpp

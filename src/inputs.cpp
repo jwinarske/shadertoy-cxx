@@ -4,6 +4,8 @@
 // inputs.cpp — GLSL preambles, the default shader, and source-wrapping helpers.
 
 #include "shadertoy/inputs.hpp"
+#include <cstdlib>
+#include <filesystem>
 
 #include <cctype>
 #include <fstream>
@@ -210,6 +212,20 @@ std::string LoadShaderFile(const std::string& path) {
   std::ostringstream ss;
   ss << file.rdbuf();
   return ss.str();
+}
+
+std::string ResolveMediaPath(const std::string& src,
+                             const std::string& media_dir) {
+  std::string dir = media_dir;
+  if (dir.empty()) {
+    const char* env = std::getenv("SHADERTOY_MEDIA_DIR");
+    if (env != nullptr)
+      dir = env;
+  }
+  if (dir.empty())
+    return src;
+  const std::filesystem::path p(src);
+  return (std::filesystem::path(dir) / p.filename()).string();
 }
 
 }  // namespace shadertoy

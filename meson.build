@@ -64,8 +64,7 @@ deps    = []
 pc_requires = []
 
 if have_gl
-    # gl_renderer pulls in stb_image (vendored) for texture channels.
-    sources += ['src/gl_renderer.cpp', 'src/stb_image_impl.cpp']
+    sources += ['src/gl_renderer.cpp']
     deps    += glesv2_dep
     pc_requires += 'glesv2'
 endif
@@ -115,6 +114,13 @@ if have_vulkan and not get_option('glslang').disabled()
     if have_glslang
         glslang_dep = [glslang_dep] + spirv_tools_deps
     endif
+endif
+
+# stb_image is the single translation unit instantiating the library, and both
+# renderers decode texture channels through it -- gated on either back-end
+# rather than on GL, and listed once so it is never compiled twice.
+if have_gl or have_vulkan
+    sources += ['src/stb_image_impl.cpp']
 endif
 
 if have_vulkan
