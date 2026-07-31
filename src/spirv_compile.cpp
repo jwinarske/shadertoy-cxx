@@ -84,7 +84,12 @@ namespace {
     return -1;
   if (pid == 0) {
     if (capture_path != nullptr) {
-      const int fd = ::open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      // Append rather than truncate: CompileToSpirv may try glslangValidator
+      // and then glslc, and a truncating second attempt erases the first's
+      // diagnostics -- so a shader that a present compiler rejected reads as
+      // "no compiler found" when the fallback is missing. The file is unique
+      // per call, so there is nothing stale to append to.
+      const int fd = ::open(capture_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
       if (fd >= 0) {
         ::dup2(fd, STDOUT_FILENO);
         ::dup2(fd, STDERR_FILENO);
@@ -215,12 +220,17 @@ std::vector<uint32_t> CompileToSpirv(const std::string& glsl_source,
   }
 
   // Echo what was captured, so redirecting the child does not cost the
-  // developer the diagnostics they would otherwise have seen inherited.
+  // developer the output they would otherwise have seen inherited.
+  //
+  // Only fold it into the caller's log on failure: glslangValidator writes the
+  // input filename to stdout on success, so appending unconditionally leaves a
+  // non-empty log after a clean compile -- which a host reads as a failure
+  // with a nonsense message.
   if (capture_path != nullptr) {
     std::string text = ReadCapture(capture);
     if (!text.empty()) {
       std::fputs(text.c_str(), stderr);
-      if (log != nullptr) {
+      if (log != nullptr && !ok) {
         log->append(text);
       }
     }

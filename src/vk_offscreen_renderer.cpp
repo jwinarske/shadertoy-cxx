@@ -8,7 +8,10 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <map>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -306,6 +309,21 @@ struct TextureVk {
   uint32_t height = 0;
 };
 
+// Channel storage kinds, matching the sampler a pass declares. A descriptor's
+// image view type has to agree with the shader's declaration, so a cubemap
+// channel binds a cube view even when its faces failed to load -- hence one
+// stub per kind rather than a single 2D one.
+enum class ChannelDim { k2D, kCube, k3D };
+
+// The six faces Shadertoy implies: face 0 is the src, faces 1..5 are
+// "<stem>_<i><ext>" beside it. Same convention GlRenderer uses.
+constexpr uint32_t kCubeFaces = 6;
+
+// Shadertoy publishes no volume format, so a volume channel is a deterministic
+// noise block. 32^3 matches GlRenderer, and seeding from the channel src keeps
+// it stable across frames and runs.
+constexpr uint32_t kVolumeSize = 32;
+
 struct VkOffscreenRenderer::Impl {
   VkExternalDevice dev{};
   VkOffscreenConfig cfg{};
@@ -339,11 +357,14 @@ struct VkOffscreenRenderer::Impl {
   // without the host having to call SetProgram again.
   ShaderProgram program{};
 
-  // 1x1 black stub, bound to every channel this renderer cannot supply
-  // (textures, cubemaps, audio, keyboard -- unimplemented here, as before).
+  // 1x1 black stubs, bound to any channel this renderer cannot supply. One per
+  // sampler kind: a descriptor's view type must match the shader's
+  // declaration, so a samplerCube channel cannot fall back to a 2D image.
   VkImage stub_image = VK_NULL_HANDLE;
   VkDeviceMemory stub_memory = VK_NULL_HANDLE;
   VkImageView stub_view = VK_NULL_HANDLE;
+  TextureVk stub_cube{};
+  TextureVk stub_volume{};
   VkSampler sampler = VK_NULL_HANDLE;
   // Samplers keyed by the Channel's filter/wrap, built on demand. Shadertoy
   // sets these per channel, and a nearest-filtered lookup table sampled
@@ -368,14 +389,31 @@ struct VkOffscreenRenderer::Impl {
   /// Record and submit the staging copy for a texture channel, leaving the
   /// image in SHADER_READ_ONLY_OPTIMAL. Submits, like the stub texture does --
   /// at SetProgram time, never per frame.
-  [[nodiscard]] bool UploadTexture(VkImage image,
-                                   VkBuffer staging,
-                                   uint32_t width,
-                                   uint32_t height);
+  [[nodiscard]] bool UploadChannelImage(VkImage image,
+                                        VkBuffer staging,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        uint32_t depth,
+                                        uint32_t layers);
   [[nodiscard]] VkSampler SamplerFor(const Channel& ch);
   /// Decode and upload @p ch's image, or return nullptr when it cannot be
   /// loaded (the caller then binds the stub, as before).
   [[nodiscard]] const TextureVk* TextureFor(const Channel& ch);
+  /// Load a cubemap channel's six faces, or return nullptr (caller binds the
+  /// cube stub).
+  [[nodiscard]] const TextureVk* CubemapFor(const Channel& ch);
+  /// Synthesise a volume channel's noise block; keyed on the channel src.
+  [[nodiscard]] const TextureVk* VolumeFor(const Channel& ch);
+  /// Create an image + view of @p dim and upload @p pixels (one contiguous
+  /// block covering every layer or slice).
+  [[nodiscard]] bool CreateChannelImage(ChannelDim dim,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        uint32_t depth_or_layers,
+                                        const void* pixels,
+                                        TextureVk* out);
+  /// The stub matching @p dim, built on first use.
+  [[nodiscard]] VkImageView StubViewFor(ChannelDim dim);
   [[nodiscard]] bool SelectBufferFormat();
   [[nodiscard]] bool CreateRenderPass();
   [[nodiscard]] bool CreateStubTexture();
@@ -651,10 +689,12 @@ bool VkOffscreenRenderer::Impl::CreateStubTexture() {
 // ── Texture channels
 // ──────────────────────────────────────────────────────────
 
-bool VkOffscreenRenderer::Impl::UploadTexture(VkImage image,
-                                              VkBuffer staging,
-                                              const uint32_t width,
-                                              const uint32_t height) {
+bool VkOffscreenRenderer::Impl::UploadChannelImage(VkImage image,
+                                                   VkBuffer staging,
+                                                   const uint32_t width,
+                                                   const uint32_t height,
+                                                   const uint32_t depth,
+                                                   const uint32_t layers) {
   VkCommandBufferAllocateInfo cba{};
   cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   cba.commandPool = setup_pool;
@@ -676,16 +716,18 @@ bool VkOffscreenRenderer::Impl::UploadTexture(VkImage image,
   to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.image = image;
-  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
   to_dst.srcAccessMask = 0;
   to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   api.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &to_dst);
 
+  // One region covers every layer or slice: the staging buffer holds them
+  // contiguously, in the order Vulkan expects (+X,-X,+Y,-Y,+Z,-Z for a cube).
   VkBufferImageCopy region{};
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {width, height, 1};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+  region.imageExtent = {width, height, depth};
   api.CmdCopyBufferToImage(cmd, staging, image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
@@ -738,6 +780,263 @@ VkSampler VkOffscreenRenderer::Impl::SamplerFor(const Channel& ch) {
   }
   samplers.emplace(key, out);
   return out;
+}
+
+bool VkOffscreenRenderer::Impl::CreateChannelImage(
+    const ChannelDim dim,
+    const uint32_t width,
+    const uint32_t height,
+    const uint32_t depth_or_layers,
+    const void* pixels,
+    TextureVk* out) {
+  const bool is_cube = dim == ChannelDim::kCube;
+  const bool is_3d = dim == ChannelDim::k3D;
+  const uint32_t layers = is_cube ? kCubeFaces : 1;
+  const uint32_t depth = is_3d ? depth_or_layers : 1;
+  const VkDeviceSize bytes =
+      static_cast<VkDeviceSize>(width) * height * depth * layers * 4;
+
+  out->width = width;
+  out->height = height;
+
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+  bool ok = true;
+  VkBufferCreateInfo bci{};
+  bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bci.size = bytes;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ok = api.CreateBuffer(dev.device, &bci, nullptr, &staging) == VK_SUCCESS;
+  if (ok) {
+    VkMemoryRequirements req{};
+    api.GetBufferMemoryRequirements(dev.device, staging, &req);
+    uint32_t type_index = 0;
+    ok = FindMemoryType(req.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &type_index);
+    if (ok) {
+      VkMemoryAllocateInfo mai{};
+      mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = type_index;
+      ok = api.AllocateMemory(dev.device, &mai, nullptr, &staging_mem) ==
+           VK_SUCCESS;
+    }
+    if (ok) {
+      ok = api.BindBufferMemory(dev.device, staging, staging_mem, 0) ==
+           VK_SUCCESS;
+    }
+    if (ok) {
+      void* mapped = nullptr;
+      ok = api.MapMemory(dev.device, staging_mem, 0, bytes, 0, &mapped) ==
+           VK_SUCCESS;
+      if (ok) {
+        std::memcpy(mapped, pixels, static_cast<size_t>(bytes));
+        api.UnmapMemory(dev.device, staging_mem);
+      }
+    }
+  }
+
+  if (ok) {
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    // A cube view needs its image created cube-compatible; the flag cannot be
+    // added at view time.
+    ici.flags = is_cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {width, height, depth};
+    ici.mipLevels = 1;
+    ici.arrayLayers = layers;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ok = api.CreateImage(dev.device, &ici, nullptr, &out->image) == VK_SUCCESS;
+  }
+  if (ok) {
+    VkMemoryRequirements req{};
+    api.GetImageMemoryRequirements(dev.device, out->image, &req);
+    uint32_t type_index = 0;
+    ok = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        &type_index);
+    if (ok) {
+      VkMemoryAllocateInfo mai{};
+      mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = type_index;
+      ok = api.AllocateMemory(dev.device, &mai, nullptr, &out->memory) ==
+           VK_SUCCESS;
+    }
+    if (ok) {
+      ok = api.BindImageMemory(dev.device, out->image, out->memory, 0) ==
+           VK_SUCCESS;
+    }
+  }
+  if (ok) {
+    ok = UploadChannelImage(out->image, staging, width, height, depth, layers);
+  }
+  if (ok) {
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = out->image;
+    vci.viewType = is_cube ? VK_IMAGE_VIEW_TYPE_CUBE
+                   : is_3d ? VK_IMAGE_VIEW_TYPE_3D
+                           : VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    ok = api.CreateImageView(dev.device, &vci, nullptr, &out->view) ==
+         VK_SUCCESS;
+  }
+
+  if (staging != VK_NULL_HANDLE) {
+    api.DestroyBuffer(dev.device, staging, nullptr);
+  }
+  if (staging_mem != VK_NULL_HANDLE) {
+    api.FreeMemory(dev.device, staging_mem, nullptr);
+  }
+  if (!ok) {
+    if (out->view != VK_NULL_HANDLE) {
+      api.DestroyImageView(dev.device, out->view, nullptr);
+    }
+    if (out->image != VK_NULL_HANDLE) {
+      api.DestroyImage(dev.device, out->image, nullptr);
+    }
+    if (out->memory != VK_NULL_HANDLE) {
+      api.FreeMemory(dev.device, out->memory, nullptr);
+    }
+    *out = TextureVk{};
+  }
+  return ok;
+}
+
+VkImageView VkOffscreenRenderer::Impl::StubViewFor(const ChannelDim dim) {
+  if (dim == ChannelDim::k2D) {
+    return stub_view;
+  }
+  TextureVk& stub = dim == ChannelDim::kCube ? stub_cube : stub_volume;
+  if (stub.view != VK_NULL_HANDLE) {
+    return stub.view;
+  }
+  // 1x1 (or 1^3) opaque black, matching the 2D stub, so an unbound channel of
+  // any kind reads the same as it always has.
+  const std::array<uint8_t, 4 * kCubeFaces> black{};
+  const uint32_t layers = dim == ChannelDim::kCube ? kCubeFaces : 1;
+  if (!CreateChannelImage(dim, 1, 1, dim == ChannelDim::k3D ? 1 : layers,
+                          black.data(), &stub)) {
+    std::fprintf(stderr,
+                 "shadertoy: could not create the %s channel stub; that "
+                 "channel kind will not bind\n",
+                 dim == ChannelDim::kCube ? "cubemap" : "volume");
+    return VK_NULL_HANDLE;
+  }
+  return stub.view;
+}
+
+const TextureVk* VkOffscreenRenderer::Impl::CubemapFor(const Channel& ch) {
+  if (ch.texture_path.empty()) {
+    return nullptr;
+  }
+  const std::string key = "cube:" + ch.texture_path;
+  if (const auto it = textures.find(key); it != textures.end()) {
+    return &it->second;
+  }
+
+  const std::filesystem::path base(
+      ResolveMediaPath(ch.texture_path, media_dir));
+  std::array<std::filesystem::path, kCubeFaces> faces;
+  faces[0] = base;
+  for (uint32_t i = 1; i < kCubeFaces; ++i) {
+    faces[i] =
+        base.parent_path() / (base.stem().string() + "_" + std::to_string(i) +
+                              base.extension().string());
+  }
+
+  // Cube faces are not flipped, unlike 2D textures: the cube sampling
+  // convention already accounts for orientation, and flipping would mirror
+  // every face.
+  stbi_set_flip_vertically_on_load(0);
+  std::vector<uint8_t> pixels;
+  uint32_t face_w = 0;
+  uint32_t face_h = 0;
+  bool ok = true;
+  for (uint32_t i = 0; i < kCubeFaces && ok; ++i) {
+    int w = 0;
+    int h = 0;
+    int comp = 0;
+    stbi_uc* px = stbi_load(faces[i].string().c_str(), &w, &h, &comp, 4);
+    if (px == nullptr || w <= 0 || h <= 0) {
+      if (px != nullptr) {
+        stbi_image_free(px);
+      }
+      std::fprintf(stderr,
+                   "shadertoy: cubemap channel '%s': face %u ('%s') could not "
+                   "be loaded; sampling the black stub instead\n",
+                   ch.texture_path.c_str(), i, faces[i].string().c_str());
+      ok = false;
+      break;
+    }
+    // Every face must match: a cube image is one allocation with six layers.
+    if (i == 0) {
+      face_w = static_cast<uint32_t>(w);
+      face_h = static_cast<uint32_t>(h);
+      pixels.resize(static_cast<size_t>(face_w) * face_h * 4 * kCubeFaces);
+    } else if (static_cast<uint32_t>(w) != face_w ||
+               static_cast<uint32_t>(h) != face_h) {
+      std::fprintf(stderr,
+                   "shadertoy: cubemap channel '%s': face %u is %dx%d but face "
+                   "0 is %ux%u; sampling the black stub instead\n",
+                   ch.texture_path.c_str(), i, w, h, face_w, face_h);
+      stbi_image_free(px);
+      ok = false;
+      break;
+    }
+    std::memcpy(pixels.data() + static_cast<size_t>(i) * face_w * face_h * 4,
+                px, static_cast<size_t>(face_w) * face_h * 4);
+    stbi_image_free(px);
+  }
+  if (!ok) {
+    return nullptr;
+  }
+
+  TextureVk tex{};
+  if (!CreateChannelImage(ChannelDim::kCube, face_w, face_h, kCubeFaces,
+                          pixels.data(), &tex)) {
+    std::fprintf(stderr, "shadertoy: failed to upload cubemap channel '%s'\n",
+                 ch.texture_path.c_str());
+    return nullptr;
+  }
+  const auto [it, inserted] = textures.emplace(key, tex);
+  return &it->second;
+}
+
+const TextureVk* VkOffscreenRenderer::Impl::VolumeFor(const Channel& ch) {
+  const std::string key =
+      "vol:" +
+      (ch.texture_path.empty() ? std::string("noise") : ch.texture_path);
+  if (const auto it = textures.find(key); it != textures.end()) {
+    return &it->second;
+  }
+  // Deterministic, and seeded the same way GlRenderer seeds it, so a shader
+  // looks the same on both back-ends rather than merely non-empty on each.
+  std::vector<uint8_t> voxels(static_cast<size_t>(kVolumeSize) * kVolumeSize *
+                              kVolumeSize * 4);
+  std::mt19937_64 rng(std::hash<std::string>{}(key));
+  std::uniform_int_distribution<int> dist(0, 255);
+  for (auto& v : voxels) {
+    v = static_cast<uint8_t>(dist(rng));
+  }
+  TextureVk tex{};
+  if (!CreateChannelImage(ChannelDim::k3D, kVolumeSize, kVolumeSize,
+                          kVolumeSize, voxels.data(), &tex)) {
+    std::fprintf(stderr, "shadertoy: failed to create the volume channel\n");
+    return nullptr;
+  }
+  const auto [it, inserted] = textures.emplace(key, tex);
+  return &it->second;
 }
 
 const TextureVk* VkOffscreenRenderer::Impl::TextureFor(const Channel& ch) {
@@ -853,7 +1152,7 @@ const TextureVk* VkOffscreenRenderer::Impl::TextureFor(const Channel& ch) {
     }
   }
   if (ok) {
-    ok = UploadTexture(tex.image, staging, width, height);
+    ok = UploadChannelImage(tex.image, staging, width, height, 1, 1);
   }
   if (ok) {
     VkImageViewCreateInfo vci{};
@@ -1239,6 +1538,20 @@ void VkOffscreenRenderer::Impl::WriteDescriptorSets() {
             view = tex->view;
             chan_sampler = SamplerFor(ch);
           }
+        } else if (ch.kind == ChannelKind::kCubemap) {
+          // The stub has to be a cube too: the pass declares samplerCube for
+          // this binding whether or not the faces loaded.
+          view = StubViewFor(ChannelDim::kCube);
+          if (const TextureVk* tex = CubemapFor(ch); tex != nullptr) {
+            view = tex->view;
+            chan_sampler = SamplerFor(ch);
+          }
+        } else if (ch.kind == ChannelKind::kVolume) {
+          view = StubViewFor(ChannelDim::k3D);
+          if (const TextureVk* tex = VolumeFor(ch); tex != nullptr) {
+            view = tex->view;
+            chan_sampler = SamplerFor(ch);
+          }
         }
         infos[i].sampler = chan_sampler;
         infos[i].imageView = view;
@@ -1299,9 +1612,31 @@ bool VkOffscreenRenderer::Impl::BuildProgram(const ShaderProgram& src) {
   // Compile and build every pipeline before touching live state, so a program
   // that fails to compile leaves the previous one running.
   compile_log.clear();
+  // The sampler a channel is declared with and the view type its descriptor
+  // binds have to agree, so the declaration is derived from the same kinds the
+  // descriptor writes below use.
+  const auto dims_for = [](const Pass& pass) {
+    std::array<SamplerDim, kChannelCount> dims{};
+    for (uint32_t i = 0; i < kChannelCount; ++i) {
+      switch (pass.channels[i].kind) {
+        case ChannelKind::kCubemap:
+          dims[i] = SamplerDim::kCube;
+          break;
+        case ChannelKind::kVolume:
+          dims[i] = SamplerDim::k3D;
+          break;
+        default:
+          dims[i] = SamplerDim::k2D;
+          break;
+      }
+    }
+    return dims;
+  };
+
   bool ok = true;
   for (size_t i = 0; i < built.size() && ok; ++i) {
-    const std::string frag = WrapVulkan(src.common, sources[i]->code);
+    const std::string frag =
+        WrapVulkan(src.common, sources[i]->code, dims_for(*sources[i]));
     VkRenderPass pass =
         built[i].target_buffer < 0 ? render_pass : buffer_render_pass;
     std::string pass_log;
@@ -1467,6 +1802,18 @@ void VkOffscreenRenderer::Impl::Cleanup() {
     }
   }
   textures.clear();
+  for (TextureVk* stub : {&stub_cube, &stub_volume}) {
+    if (stub->view != VK_NULL_HANDLE) {
+      api.DestroyImageView(dev.device, stub->view, nullptr);
+    }
+    if (stub->image != VK_NULL_HANDLE) {
+      api.DestroyImage(dev.device, stub->image, nullptr);
+    }
+    if (stub->memory != VK_NULL_HANDLE) {
+      api.FreeMemory(dev.device, stub->memory, nullptr);
+    }
+    *stub = TextureVk{};
+  }
   for (auto& [key, s] : samplers) {
     api.DestroySampler(dev.device, s, nullptr);
   }
