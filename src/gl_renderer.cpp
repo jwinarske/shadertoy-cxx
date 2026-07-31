@@ -53,7 +53,7 @@ GlRenderer::~GlRenderer() {
   Destroy();
 }
 
-GLuint GlRenderer::Compile(GLenum type, const char* src) {
+GLuint GlRenderer::Compile(GLenum type, const char* src, std::string* log) {
   const GLuint shader = glCreateShader(type);
   glShaderSource(shader, 1, &src, nullptr);
   glCompileShader(shader);
@@ -62,10 +62,17 @@ GLuint GlRenderer::Compile(GLenum type, const char* src) {
   if (ok != GL_TRUE) {
     GLint len = 0;
     glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
-    std::string log(static_cast<size_t>(len > 0 ? len : 1), '\0');
-    glGetShaderInfoLog(shader, len, nullptr, log.data());
-    std::fprintf(stderr, "shadertoy: GLSL %s compile failed:\n%s\n",
-                 type == GL_VERTEX_SHADER ? "vertex" : "fragment", log.c_str());
+    std::string info(static_cast<size_t>(len > 0 ? len : 1), '\0');
+    glGetShaderInfoLog(shader, len, nullptr, info.data());
+    const char* stage = type == GL_VERTEX_SHADER ? "vertex" : "fragment";
+    std::fprintf(stderr, "shadertoy: GLSL %s compile failed:\n%s\n", stage,
+                 info.c_str());
+    // Also to the caller's buffer: stderr is where a developer looks, this is
+    // what a host can put in front of a user.
+    if (log != nullptr) {
+      log->append("GLSL ").append(stage).append(" compile failed:\n");
+      log->append(info.c_str());
+    }
     glDeleteShader(shader);
     return 0;
   }
@@ -91,8 +98,8 @@ bool GlRenderer::BuildPass(const std::string& common,
     }
   }
   const std::string fs_src = WrapGles(common, pass.code, dims);
-  const GLuint vs = Compile(GL_VERTEX_SHADER, kVertexShader);
-  const GLuint fs = Compile(GL_FRAGMENT_SHADER, fs_src.c_str());
+  const GLuint vs = Compile(GL_VERTEX_SHADER, kVertexShader, &compile_log_);
+  const GLuint fs = Compile(GL_FRAGMENT_SHADER, fs_src.c_str(), &compile_log_);
   if (vs == 0 || fs == 0) {
     if (vs)
       glDeleteShader(vs);
@@ -114,6 +121,7 @@ bool GlRenderer::BuildPass(const std::string& common,
     std::string log(static_cast<size_t>(len > 0 ? len : 1), '\0');
     glGetProgramInfoLog(program, len, nullptr, log.data());
     std::fprintf(stderr, "shadertoy: program link failed:\n%s\n", log.c_str());
+    compile_log_.append("program link failed:\n").append(log.c_str());
     glDeleteProgram(program);
     return false;
   }
@@ -480,6 +488,7 @@ bool GlRenderer::uses_buffer_internal(int b) const noexcept {
 }
 
 bool GlRenderer::SetProgram(const ShaderProgram& program) {
+  compile_log_.clear();
   if (vao_ == 0)
     glGenVertexArrays(1, &vao_);
 
@@ -492,15 +501,31 @@ bool GlRenderer::SetProgram(const ShaderProgram& program) {
     if (!program.uses_buffer(b))
       continue;
     PassGL pg;
+    // Tag only if the pass actually appends something: BuildPass writes to
+    // compile_log_ on failure, so the marker is inserted at the offset it
+    // started from. Tagging up front would leave a header in the log after a
+    // clean compile, making a success look like a failure with no detail.
+    const size_t mark = compile_log_.size();
     if (!BuildPass(program.common, program.buffers[static_cast<size_t>(b)], b,
                    pg)) {
+      // "Buffer B" is a better starting point than "the program" when a shader
+      // has five of them, and the log's line numbers are relative to this
+      // pass's wrapped source.
+      if (compile_log_.size() > mark) {
+        compile_log_.insert(mark, std::string("Buffer ") +
+                                      static_cast<char>('A' + b) + " pass:\n");
+      }
       for (PassGL& done : new_buffers)
         DestroyPass(done);
       return false;
     }
     new_buffers.push_back(std::move(pg));
   }
+  const size_t image_mark = compile_log_.size();
   if (!BuildPass(program.common, program.image, -1, new_image)) {
+    if (compile_log_.size() > image_mark) {
+      compile_log_.insert(image_mark, "Image pass:\n");
+    }
     for (PassGL& done : new_buffers)
       DestroyPass(done);
     return false;
