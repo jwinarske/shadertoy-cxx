@@ -133,7 +133,6 @@ struct VkOffscreenApi {
   PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
   PFN_vkQueueSubmit QueueSubmit = nullptr;
   PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
-  PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
   PFN_vkCmdBeginRenderPass CmdBeginRenderPass = nullptr;
   PFN_vkCmdEndRenderPass CmdEndRenderPass = nullptr;
   PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
@@ -243,7 +242,6 @@ bool VkOffscreenApi::Load(PFN_vkGetInstanceProcAddr gipa,
   ST_VKO_DEVICE_FN(EndCommandBuffer, "vkEndCommandBuffer");
   ST_VKO_DEVICE_FN(QueueSubmit, "vkQueueSubmit");
   ST_VKO_DEVICE_FN(QueueWaitIdle, "vkQueueWaitIdle");
-  ST_VKO_DEVICE_FN(DeviceWaitIdle, "vkDeviceWaitIdle");
   ST_VKO_DEVICE_FN(CmdBeginRenderPass, "vkCmdBeginRenderPass");
   ST_VKO_DEVICE_FN(CmdEndRenderPass, "vkCmdEndRenderPass");
   ST_VKO_DEVICE_FN(CmdBindPipeline, "vkCmdBindPipeline");
@@ -1976,13 +1974,22 @@ VkFramebuffer VkOffscreenRenderer::Impl::FramebufferFor(
 // ──────────────────────────────────────────────────────────────────
 
 void VkOffscreenRenderer::Impl::Cleanup() {
-  if (dev.device == VK_NULL_HANDLE || api.DeviceWaitIdle == nullptr) {
+  if (dev.device == VK_NULL_HANDLE) {
     return;
   }
-  // The host may still have work in flight referencing these objects. It owns
-  // submission, so it should have idled already — but destroying a live
-  // pipeline is unrecoverable, and one wait at teardown costs nothing.
-  api.DeviceWaitIdle(dev.device);
+  // The host owns submission, so it owns the guarantee that nothing it
+  // submitted still references these objects (see ~VkOffscreenRenderer).
+  //
+  // The wait below is a safety net for the usual case -- a host that submits
+  // its RecordRender command buffers on the queue it lent us -- and nothing
+  // more. It is not vkDeviceWaitIdle: the device is the host's, and
+  // vkDeviceWaitIdle needs every queue on it externally synchronized, which an
+  // interposed loader that serializes one shared queue cannot provide.
+  // vkQueueWaitIdle on the lent queue goes through that interposition like any
+  // submit.
+  if (dev.queue != VK_NULL_HANDLE && api.QueueWaitIdle != nullptr) {
+    static_cast<void>(api.QueueWaitIdle(dev.queue));
+  }
 
   for (auto& [view, fb] : framebuffers) {
     api.DestroyFramebuffer(dev.device, fb, nullptr);

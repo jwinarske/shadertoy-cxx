@@ -47,8 +47,10 @@ struct VkExternalDevice {
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   VkDevice device = VK_NULL_HANDLE;
 
-  /// A graphics queue on @device. Used only during Create (a one-time upload of
-  /// the stub channel texture) — never at frame time, where the caller submits.
+  /// A graphics queue on @device. Used for one-time uploads (the stub channel
+  /// texture at Create, channel textures when a program is built), and waited
+  /// on at destruction as a safety net — never at frame time, where the caller
+  /// submits.
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t queue_family_index = 0;
 
@@ -99,6 +101,12 @@ class VkOffscreenRenderer {
       const VkExternalDevice& device,
       const VkOffscreenConfig& config);
 
+  /// The caller must ensure no submitted command buffer still references this
+  /// renderer's objects — the ones RecordRender recorded into — before
+  /// destroying it, exactly as for SetProgram. The renderer does not wait on
+  /// the device it borrows: vkDeviceWaitIdle needs every queue of the host's
+  /// device externally synchronized. It does wait on @VkExternalDevice::queue,
+  /// which covers a host that submits there and nothing else.
   ~VkOffscreenRenderer();
 
   VkOffscreenRenderer(const VkOffscreenRenderer&) = delete;
@@ -108,6 +116,11 @@ class VkOffscreenRenderer {
   /// the pipeline. Returns false on compile or link failure, leaving the
   /// previous program intact — matching GlRenderer::SetProgram, so a host can
   /// hot-swap shaders without risking a blank view.
+  ///
+  /// On success the previous program's pipelines, descriptor pool and buffer
+  /// images are destroyed before this returns, so the caller must ensure no
+  /// submitted command buffer recorded against that program is still executing
+  /// — wait on its fences first. A failed build destroys nothing.
   ///
   /// Multi-pass programs (Buffer A..D) are supported: each buffer pass renders
   /// into its own ping-ponged offscreen pair, and a kBuffer channel samples the
